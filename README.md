@@ -95,6 +95,7 @@ bun run dev:pages
 - 推送到 `main` 分支会自动更新生产环境。
 - 其他分支和 Pull Request 可生成独立预览环境。
 - 不需要环境变量、数据库或 Cloudflare 服务端密钥。
+- 必须保留 `wrangler.jsonc`。它只配置 Pages，并将 AT / RT 验证函数放置在 OpenAI 支持的美国区域；静态页面仍由 Cloudflare 就近分发。
 
 ### 命令行手动部署
 
@@ -119,6 +120,7 @@ src/core/redaction.ts      预览敏感字段脱敏
 src/core/zip.ts            无依赖 ZIP 打包
 functions/api/openai/      Cloudflare Pages RT 刷新接口
 public/_headers            Cloudflare Pages 安全响应头
+wrangler.jsonc             Pages 构建目录与验证函数运行区域
 scripts/check-build.ts     生产构建完整性与隐私边界检查
 tests/core.test.ts         解析、互转、脱敏与 ZIP 回归测试
 tests/openai-refresh.test.ts  OAuth 转发与客户端回退测试

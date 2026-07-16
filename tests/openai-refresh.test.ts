@@ -95,6 +95,31 @@ describe("Cloudflare OpenAI refresh function", () => {
     expect(forwarded).toBe(false);
   });
 
+  test("returns JSON when the OAuth response body cannot be read", async () => {
+    const upstream = new Response(null, { status: 502 });
+    upstream.text = async () => {
+      throw new Error("upstream body terminated");
+    };
+    const response = await handleOpenAiRefresh(new Request(
+      "https://session.example/api/openai/refresh",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          refresh_token: "input-refresh-token",
+          client_id: OPENAI_CODEX_CLIENT_ID,
+        }),
+      },
+    ), async () => upstream);
+
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "OPENAI_OAUTH_RESPONSE_READ_FAILED",
+        message: "OpenAI OAuth 响应读取失败（HTTP 502）",
+      },
+    });
+  });
+
   test("validates at- tokens through the fixed OpenAI whoami endpoint", async () => {
     let forwardedUrl = "";
     let authorization = "";
@@ -134,6 +159,28 @@ describe("Cloudflare OpenAI refresh function", () => {
       chatgpt_account_is_fedramp: false,
     });
     expect(payload.ignored_field).toBeUndefined();
+  });
+
+  test("returns JSON when the AT response body cannot be read", async () => {
+    const upstream = new Response(null, { status: 502 });
+    upstream.text = async () => {
+      throw new Error("upstream body terminated");
+    };
+    const response = await handleOpenAiWhoami(new Request(
+      "https://session.example/api/openai/whoami",
+      {
+        method: "POST",
+        body: JSON.stringify({ access_token: "at-input-token" }),
+      },
+    ), async () => upstream);
+
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "OPENAI_CODEX_PAT_RESPONSE_READ_FAILED",
+        message: "OpenAI AT 验证响应读取失败（HTTP 502）",
+      },
+    });
   });
 });
 
@@ -191,6 +238,43 @@ describe("browser RT refresh client", () => {
         chatgpt_plan_type: "plus",
         chatgpt_account_is_fedramp: false,
       });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("reports a platform-level plain-text HTTP error", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input, _init) => new Response("error code: 502", {
+      status: 502,
+      headers: { "Content-Type": "text/plain" },
+    })) as typeof fetch;
+
+    try {
+      await expect(refreshOpenAiToken("input-refresh-token")).rejects.toMatchObject({
+        message: "RT 联网验证接口返回 HTTP 502",
+        status: 502,
+        code: "OPENAI_OAUTH_REQUEST_FAILED",
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("reports a platform-level plain-text AT error", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input, _init) => new Response("error code: 502", {
+      status: 502,
+      headers: { "Content-Type": "text/plain" },
+    })) as typeof fetch;
+
+    try {
+      await expect(validateOpenAiPersonalAccessToken("at-input-token"))
+        .rejects.toMatchObject({
+          message: "AT 联网验证接口返回 HTTP 502",
+          status: 502,
+          code: "OPENAI_CODEX_PAT_VALIDATE_FAILED",
+        });
     } finally {
       globalThis.fetch = originalFetch;
     }

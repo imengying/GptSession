@@ -13,6 +13,11 @@ interface RefreshErrorPayload {
   };
 }
 
+interface ParsedResponse<T> {
+  payload: RefreshErrorPayload & Partial<T>;
+  plainText?: string;
+}
+
 export class OpenAiRefreshError extends Error {
   readonly code: string;
   readonly status: number;
@@ -27,6 +32,36 @@ export class OpenAiRefreshError extends Error {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+async function parseResponse<T>(response: Response): Promise<ParsedResponse<T>> {
+  const text = await response.text().catch(() => "");
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (parsed && typeof parsed === "object") {
+      return {
+        payload: parsed as RefreshErrorPayload & Partial<T>,
+      };
+    }
+  } catch {
+    // A platform-level Cloudflare error can be plain text rather than JSON.
+  }
+  return {
+    payload: {},
+    plainText: stringValue(text),
+  };
+}
+
+function httpErrorMessage(
+  label: "RT" | "AT",
+  response: Response,
+  plainText?: string,
+): string {
+  const platformError = plainText?.toLowerCase() === "error code: " + response.status;
+  if (plainText && !platformError && plainText.length <= 200) {
+    return label + " 联网验证失败（HTTP " + response.status + "）：" + plainText;
+  }
+  return label + " 联网验证接口返回 HTTP " + response.status;
 }
 
 async function requestRefreshToken(
@@ -56,8 +91,7 @@ async function requestRefreshToken(
     throw new OpenAiRefreshError("无法连接 RT 联网验证接口，请稍后重试");
   }
 
-  const payload = await response.json().catch(() => ({})) as RefreshErrorPayload
-    & Partial<OpenAiOAuthTokenInfo>;
+  const { payload, plainText } = await parseResponse<OpenAiOAuthTokenInfo>(response);
   if (!response.ok) {
     if (response.status === 404) {
       throw new OpenAiRefreshError(
@@ -68,7 +102,7 @@ async function requestRefreshToken(
     }
     const code = stringValue(payload.error?.code) ?? "OPENAI_OAUTH_REQUEST_FAILED";
     const message = stringValue(payload.error?.message)
-      ?? "OpenAI 无法验证该 Refresh Token";
+      ?? httpErrorMessage("RT", response, plainText);
     throw new OpenAiRefreshError(message, response.status, code);
   }
 
@@ -140,8 +174,7 @@ export async function validateOpenAiPersonalAccessToken(
     throw new OpenAiRefreshError("无法连接 AT 联网验证接口，请稍后重试");
   }
 
-  const payload = await response.json().catch(() => ({})) as RefreshErrorPayload
-    & Partial<OpenAiPersonalAccessTokenInfo>;
+  const { payload, plainText } = await parseResponse<OpenAiPersonalAccessTokenInfo>(response);
   if (!response.ok) {
     if (response.status === 404) {
       throw new OpenAiRefreshError(
@@ -152,7 +185,7 @@ export async function validateOpenAiPersonalAccessToken(
     }
     const code = stringValue(payload.error?.code) ?? "OPENAI_CODEX_PAT_VALIDATE_FAILED";
     const message = stringValue(payload.error?.message)
-      ?? "OpenAI 无法验证该 Personal Access Token";
+      ?? httpErrorMessage("AT", response, plainText);
     throw new OpenAiRefreshError(message, response.status, code);
   }
 

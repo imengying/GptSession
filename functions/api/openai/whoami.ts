@@ -120,7 +120,17 @@ export async function handleOpenAiWhoami(
     }, 502);
   }
 
-  const text = await upstream.text();
+  let text: string;
+  try {
+    text = await upstream.text();
+  } catch {
+    return jsonResponse({
+      error: {
+        code: "OPENAI_CODEX_PAT_RESPONSE_READ_FAILED",
+        message: "OpenAI AT 验证响应读取失败（HTTP " + upstream.status + "）",
+      },
+    }, 502);
+  }
   let payload: JsonRecord = {};
   try {
     const parsed = JSON.parse(text) as unknown;

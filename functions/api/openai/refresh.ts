@@ -151,7 +151,17 @@ export async function handleOpenAiRefresh(
     }, 502);
   }
 
-  const text = await upstream.text();
+  let text: string;
+  try {
+    text = await upstream.text();
+  } catch {
+    return jsonResponse({
+      error: {
+        code: "OPENAI_OAUTH_RESPONSE_READ_FAILED",
+        message: "OpenAI OAuth 响应读取失败（HTTP " + upstream.status + "）",
+      },
+    }, 502);
+  }
   let payload: JsonRecord = {};
   try {
     const parsed = JSON.parse(text) as unknown;
