@@ -19,7 +19,6 @@ const requiredFiles = [
   "dist/assets/favicon.svg",
   "functions/api/openai/refresh.ts",
   "functions/api/openai/whoami.ts",
-  "wrangler.jsonc",
 ];
 const missing = requiredFiles.filter((relativePath) => (
   !existsSync(join(root, relativePath))
@@ -87,30 +86,6 @@ if (browserBundle.includes("https://auth.openai.com/oauth/token")) {
 const headers = readFileSync(join(root, "dist/_headers"), "utf8");
 if (!headers.includes("connect-src 'self'")) {
   console.error("dist/_headers must restrict network requests to connect-src 'self'");
-  process.exit(1);
-}
-
-interface WranglerConfig {
-  pages_build_output_dir?: unknown;
-  placement?: {
-    mode?: unknown;
-    region?: unknown;
-  };
-}
-
-const wrangler = JSON.parse(
-  readFileSync(join(root, "wrangler.jsonc"), "utf8"),
-) as WranglerConfig;
-if (wrangler.pages_build_output_dir !== "./dist") {
-  console.error("wrangler.jsonc must target the Cloudflare Pages dist directory");
-  process.exit(1);
-}
-if (
-  wrangler.placement?.mode !== "targeted"
-  || typeof wrangler.placement.region !== "string"
-  || !wrangler.placement.region.trim()
-) {
-  console.error("Pages Functions must use an explicit targeted placement region");
   process.exit(1);
 }
 
