@@ -200,7 +200,7 @@ a {
 }
 
 .hero {
-  padding: clamp(18px, 2vw, 26px) 2px clamp(18px, 2vw, 24px);
+  padding: 14px 2px 16px;
 }
 
 .hero-copy {
@@ -216,25 +216,9 @@ a {
   letter-spacing: 0.18em;
 }
 
-.hero h1 {
-  max-width: 860px;
-  margin: 0;
-  font-size: clamp(1.75rem, 2.7vw, 2.65rem);
-  font-weight: 680;
-  line-height: 1.06;
-  letter-spacing: -0.045em;
-}
-
-.hero h1 span {
-  color: transparent;
-  background: linear-gradient(90deg, var(--text) 5%, #aebcc8 75%);
-  -webkit-background-clip: text;
-  background-clip: text;
-}
-
 .hero-lead {
   max-width: 720px;
-  margin: 9px 0 0;
+  margin: 0;
   color: var(--muted-strong);
   font-size: clamp(0.88rem, 1.05vw, 0.98rem);
   line-height: 1.6;
@@ -686,7 +670,7 @@ textarea {
 
 table {
   width: 100%;
-  min-width: 660px;
+  min-width: 640px;
   border-collapse: collapse;
   table-layout: fixed;
 }
@@ -823,11 +807,16 @@ tbody tr:hover:not(.empty-row) {
   background: rgba(120, 230, 172, 0.06);
 }
 
-.status-chip.is-expired,
-.status-chip.is-warning {
+.status-chip.is-expired {
   border-color: rgba(255, 135, 125, 0.2);
   color: var(--danger);
   background: rgba(255, 135, 125, 0.06);
+}
+
+.status-chip.is-warning {
+  border-color: rgba(255, 199, 107, 0.22);
+  color: var(--amber);
+  background: rgba(255, 199, 107, 0.06);
 }
 
 .expiry-detail {
@@ -1020,12 +1009,7 @@ tbody tr:hover:not(.empty-row) {
   }
 
   .hero {
-    padding: 20px 2px;
-  }
-
-  .hero h1 {
-    max-width: 720px;
-    font-size: clamp(1.7rem, 4.8vw, 2.35rem);
+    padding: 14px 2px 16px;
   }
 
   .toolbar-actions .button {
@@ -1053,16 +1037,10 @@ tbody tr:hover:not(.empty-row) {
   }
 
   .hero {
-    padding: 16px 2px 18px;
-  }
-
-  .hero h1 {
-    font-size: clamp(1.55rem, 7vw, 1.95rem);
-    line-height: 1.08;
+    padding: 12px 2px 14px;
   }
 
   .hero-lead {
-    margin-top: 8px;
     font-size: 0.86rem;
   }
 
@@ -1135,6 +1113,20 @@ tbody tr:hover:not(.empty-row) {
 
   .preview-badge {
     display: none;
+  }
+
+  .table-wrap thead th:last-child,
+  .table-wrap tbody tr:not(.empty-row) td:last-child {
+    position: sticky;
+    right: 0;
+    z-index: 1;
+    background: #101923;
+    box-shadow: -10px 0 18px rgba(5, 9, 14, 0.38);
+  }
+
+  .table-wrap thead th:last-child {
+    z-index: 2;
+    background: #14202c;
   }
 
 }

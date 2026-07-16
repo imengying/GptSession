@@ -54,6 +54,7 @@ const elements = {
   issuesList: element<HTMLUListElement>("#issues-list"),
   issuesSummary: element<HTMLElement>("#issues-summary"),
   outputMeta: element<HTMLElement>("#output-meta"),
+  outputPanel: element<HTMLElement>("#output-panel"),
   outputPreview: element<HTMLTextAreaElement>("#output-preview"),
   outputTitle: element<HTMLElement>("#output-title"),
   pickFiles: element<HTMLButtonElement>("#pick-files"),
@@ -175,6 +176,9 @@ function renderFormatControls(): void {
     button.classList.toggle("is-active", active);
     button.setAttribute("aria-selected", String(active));
     button.tabIndex = active ? 0 : -1;
+    if (active && button.id) {
+      elements.outputPanel.setAttribute("aria-labelledby", button.id);
+    }
   }
 
   if (state.format === "cpa") {
@@ -293,8 +297,6 @@ function renderAccounts(): void {
     const sourceDetail = sourceBase + (sourcePath ? " · " + sourcePath : "");
     const sourceTitle = account.sourceName
       + (sourcePath ? " · " + sourcePath : "");
-    const downloadLabel = state.format === "cpa" ? "CPA JSON" : "单账号 JSON";
-
     return `<tr>
       <td>
         <span class="account-primary" title="${accountName}">${accountName}</span>
@@ -307,7 +309,7 @@ function renderAccounts(): void {
         <span class="account-secondary" title="${escapeHtml(sourceTitle)}">${escapeHtml(sourceDetail)}</span>
       </td>
       <td>
-        <button class="inline-button" type="button" data-download-index="${index}">${downloadLabel}</button>
+        <button class="inline-button" type="button" data-download-index="${index}">下载 JSON</button>
       </td>
     </tr>`;
   }).join("");
@@ -575,6 +577,27 @@ function setFormat(format: string | undefined): void {
 
 for (const button of elements.formatButtons) {
   button.addEventListener("click", () => setFormat(button.dataset.format));
+  button.addEventListener("keydown", (event) => {
+    const currentIndex = elements.formatButtons.indexOf(button);
+    let nextIndex: number | undefined;
+    if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      nextIndex = (currentIndex - 1 + elements.formatButtons.length)
+        % elements.formatButtons.length;
+    } else if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      nextIndex = (currentIndex + 1) % elements.formatButtons.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = elements.formatButtons.length - 1;
+    }
+    if (nextIndex === undefined) {
+      return;
+    }
+    event.preventDefault();
+    const nextButton = elements.formatButtons[nextIndex];
+    setFormat(nextButton.dataset.format);
+    nextButton.focus();
+  });
 }
 
 elements.input.addEventListener("paste", () => {

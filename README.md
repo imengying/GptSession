@@ -5,6 +5,8 @@ Vite 构建，可直接部署到 Cloudflare Pages。
 
 所有解析、转换、预览与打包均在当前浏览器内完成，凭证不会上传到服务器。
 
+在线预览：[Session Bridge](https://elysiaya.xyz)
+
 ## 支持格式
 
 | 输入 | 可导出 |
