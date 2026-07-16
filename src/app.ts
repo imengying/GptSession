@@ -1,20 +1,28 @@
 import {
   buildZipArchive,
   buildOutputDocument,
+  getAccountCredentialKeys,
   getDownloadDescriptor,
   getSub2ApiDocumentConflicts,
   parseCredentialText,
+  parseManualTokenText,
   redactSensitiveDocument,
   type AccountSourceType,
   type DownloadDescriptor,
+  type ManualTokenType,
   type NormalizedAccount,
   type OutputDocument,
   type OutputFormat,
   type ParseIssue,
+  type RefreshTokenVariant,
 } from "./core";
+
+type InputMode = "json" | ManualTokenType;
 
 interface AppState {
   format: OutputFormat;
+  inputMode: InputMode;
+  refreshTokenVariant: RefreshTokenVariant;
   accounts: NormalizedAccount[];
   issues: ParseIssue[];
   revealSecrets: boolean;
@@ -23,6 +31,8 @@ interface AppState {
 
 const state: AppState = {
   format: "sub2api",
+  inputMode: "json",
+  refreshTokenVariant: "standard",
   accounts: [],
   issues: [],
   revealSecrets: false,
@@ -50,7 +60,16 @@ const elements = {
   ),
   formatDescription: element<HTMLElement>("#format-description"),
   input: element<HTMLTextAreaElement>("#session-input"),
+  inputContentLabel: element<HTMLLabelElement>("#input-content-label"),
+  inputDescription: element<HTMLElement>("#input-description"),
+  inputGuideDescription: element<HTMLElement>("#input-guide-description"),
+  inputGuideTitle: element<HTMLElement>("#input-guide-title"),
+  inputHint: element<HTMLElement>("#input-hint"),
+  inputModeButtons: Array.from(
+    document.querySelectorAll<HTMLButtonElement>("[data-input-mode]"),
+  ),
   inputStatus: element<HTMLElement>("#input-status"),
+  inputToolbar: element<HTMLElement>(".input-toolbar"),
   issuesBox: element<HTMLDetailsElement>("#issues-box"),
   issuesList: element<HTMLUListElement>("#issues-list"),
   issuesSummary: element<HTMLElement>("#issues-summary"),
@@ -61,6 +80,7 @@ const elements = {
   pickFiles: element<HTMLButtonElement>("#pick-files"),
   pickFolder: element<HTMLButtonElement>("#pick-folder"),
   previewBadge: element<HTMLElement>("#preview-badge"),
+  refreshTokenVariant: element<HTMLSelectElement>("#rt-variant"),
   statAccounts: element<HTMLElement>("#stat-accounts"),
   statIssues: element<HTMLElement>("#stat-issues"),
   statRefreshable: element<HTMLElement>("#stat-refreshable"),
@@ -71,12 +91,15 @@ const elements = {
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_TOTAL_IMPORT_SIZE = 50 * 1024 * 1024;
 const MAX_FILES = 500;
+let inputOperationId = 0;
 let toastTimer: number | undefined;
 
 const SOURCE_LABELS: Record<AccountSourceType, string> = {
   chatgpt_web_session: "SESSION",
   cpa: "CPA",
   sub2api: "Sub2API",
+  manual_at: "AT",
+  manual_rt: "RT",
 };
 
 function escapeHtml(value: unknown): string {
@@ -157,18 +180,27 @@ function getWarningCount(): number {
 }
 
 function getFormatIssues(): ParseIssue[] {
-  if (state.format !== "sub2api") {
-    return [];
+  const issues: ParseIssue[] = [];
+  if (
+    state.format === "cpa"
+    && state.accounts.some((account) => !account.accessToken && account.refreshToken)
+  ) {
+    issues.push({
+      sourceName: "CPA RT 导出",
+      reason: "部分凭证仅包含 refresh_token，access_token 与账号信息需由目标端刷新后补齐",
+    });
   }
-  const conflicts = getSub2ApiDocumentConflicts(state.accounts);
-  if (!conflicts.length) {
-    return [];
+  if (state.format === "sub2api") {
+    const conflicts = getSub2ApiDocumentConflicts(state.accounts);
+    if (conflicts.length) {
+      issues.push({
+        sourceName: "Sub2API 合并导出",
+        reason: "多个导入包的顶层字段存在冲突，已从合并结果中省略："
+          + conflicts.join("、"),
+      });
+    }
   }
-  return [{
-    sourceName: "Sub2API 合并导出",
-    reason: "多个导入包的顶层字段存在冲突，已从合并结果中省略："
-      + conflicts.join("、"),
-  }];
+  return issues;
 }
 
 function getExportDate(): Date {
@@ -185,6 +217,56 @@ function getCurrentOutputText(): string {
   return state.accounts.length
     ? JSON.stringify(getCurrentDocument(), null, 2)
     : "";
+}
+
+function renderInputControls(): void {
+  for (const button of elements.inputModeButtons) {
+    const active = button.dataset.inputMode === state.inputMode;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-checked", String(active));
+    button.tabIndex = active ? 0 : -1;
+  }
+
+  const tokenMode = state.inputMode !== "json";
+  elements.inputToolbar.classList.toggle("is-token-mode", tokenMode);
+  elements.pickFiles.hidden = tokenMode;
+  elements.pickFolder.hidden = tokenMode;
+  elements.refreshTokenVariant.hidden = state.inputMode !== "rt";
+  elements.refreshTokenVariant.value = state.refreshTokenVariant;
+
+  if (state.inputMode === "at") {
+    elements.inputDescription.textContent =
+      "手动粘贴 Access Token，支持批量生成 Sub2API 或 CPA 凭证。";
+    elements.inputGuideTitle.textContent = "手动输入 Access Token";
+    elements.inputGuideDescription.textContent =
+      "JWT AT 会自动解析账号与过期信息；at- token 将按 Codex Personal Access Token 导出。";
+    elements.inputContentLabel.textContent = "Access Token";
+    elements.inputHint.textContent = "每行一个 · 自动去重 · 不联网验证";
+    elements.input.placeholder = "eyJ...\nat-...";
+    return;
+  }
+
+  if (state.inputMode === "rt") {
+    elements.inputDescription.textContent =
+      "手动粘贴 Refresh Token，支持批量生成 Sub2API 或 CPA 凭证。";
+    elements.inputGuideTitle.textContent = "手动输入 Refresh Token";
+    elements.inputGuideDescription.textContent =
+      "RT 不会在本地验证；邮箱、账号 ID 与 Access Token 需由目标端刷新后补齐。";
+    elements.inputContentLabel.textContent = "Refresh Token";
+    elements.inputHint.textContent = "每行一个 · 支持标准 RT 与 Mobile RT";
+    elements.input.placeholder = "每行粘贴一个 Refresh Token";
+    return;
+  }
+
+  elements.inputDescription.textContent =
+    "粘贴 JSON，或导入一个文件、多个文件及整个目录。";
+  elements.inputGuideTitle.textContent = "自动识别 Session、CPA 与 Sub2API";
+  elements.inputGuideDescription.innerHTML =
+    'ChatGPT Session 可从 <a href="https://chatgpt.com/api/auth/session" target="_blank" rel="noreferrer">chatgpt.com/api/auth/session</a> 获取。';
+  elements.inputContentLabel.textContent = "JSON 内容";
+  elements.inputHint.textContent = "粘贴后自动解析 · 支持连续 JSON 与拖入文件";
+  elements.input.placeholder =
+    '{"type":"codex","email":"you@example.com","access_token":"..."}';
 }
 
 function renderFormatControls(): void {
@@ -363,6 +445,7 @@ function renderIssues(): void {
 }
 
 function renderAll(): void {
+  renderInputControls();
   renderAccounts();
   renderIssues();
   renderOutput();
@@ -396,11 +479,12 @@ function mergeParsedResult(
     state.accounts = [];
     state.issues = [];
   }
-  const seenTokens = new Set(
-    state.accounts.map((account) => account.accessToken),
+  const seenCredentials = new Set(
+    state.accounts.flatMap((account) => getAccountCredentialKeys(account)),
   );
   for (const account of result.accounts) {
-    if (seenTokens.has(account.accessToken)) {
+    const credentialKeys = getAccountCredentialKeys(account);
+    if (credentialKeys.some((key) => seenCredentials.has(key))) {
       state.issues.push({
         sourceName: account.sourceName,
         sourcePath: account.sourcePath,
@@ -408,7 +492,7 @@ function mergeParsedResult(
       });
       continue;
     }
-    seenTokens.add(account.accessToken);
+    credentialKeys.forEach((key) => seenCredentials.add(key));
     state.accounts.push(account);
   }
   state.issues.push(...result.issues);
@@ -429,7 +513,11 @@ function processPastedInput(): void {
     return;
   }
   setInputStatus("正在本地解析粘贴内容…", "working");
+  const operationId = ++inputOperationId;
   window.setTimeout(() => {
+    if (operationId !== inputOperationId || state.inputMode !== "json") {
+      return;
+    }
     const result = parseCredentialText(text, {
       sourceName: "粘贴内容",
       now: new Date(),
@@ -449,7 +537,67 @@ function processPastedInput(): void {
   }, 20);
 }
 
+function processManualTokenInput(): void {
+  const text = elements.input.value;
+  const tokenType = state.inputMode;
+  if (tokenType !== "at" && tokenType !== "rt") {
+    return;
+  }
+  if (!text.trim()) {
+    setInputStatus(
+      "请先粘贴 " + (tokenType === "at" ? "Access Token。" : "Refresh Token。"),
+      "error",
+    );
+    showToast("没有可解析的输入", "error");
+    return;
+  }
+  if (new Blob([text]).size > MAX_TOTAL_IMPORT_SIZE) {
+    setInputStatus("粘贴内容超过 50 MB，请拆分后再导入。", "error");
+    showToast("粘贴内容过大", "error");
+    return;
+  }
+
+  const label = tokenType === "at" ? "AT" : "RT";
+  const variant = state.refreshTokenVariant;
+  const operationId = ++inputOperationId;
+  setInputStatus("正在本地解析 " + label + "…", "working");
+  window.setTimeout(() => {
+    if (operationId !== inputOperationId || state.inputMode !== tokenType) {
+      return;
+    }
+    const result = parseManualTokenText(text, tokenType, {
+      maxTokens: MAX_FILES,
+      now: new Date(),
+      refreshTokenVariant: variant,
+      sourceName: "手动 " + label,
+    });
+    mergeParsedResult(result, true);
+    renderAll();
+    if (state.accounts.length) {
+      setInputStatus(
+        label + " 解析完成：可导出 " + state.accounts.length
+          + " 个账号，发现 " + getWarningCount() + " 条提示。",
+        "success",
+      );
+    } else {
+      setInputStatus("未找到可导出的 " + label + "。", "error");
+    }
+  }, 20);
+}
+
+function processCurrentInput(): void {
+  if (state.inputMode === "json") {
+    processPastedInput();
+  } else {
+    processManualTokenInput();
+  }
+}
+
 async function processFiles(fileList: FileList | File[]): Promise<void> {
+  if (state.inputMode !== "json") {
+    return;
+  }
+  const operationId = ++inputOperationId;
   const allFiles = Array.from(fileList);
   const jsonCandidates = allFiles.filter(
     (file) => file.name.toLowerCase().endsWith(".json"),
@@ -502,6 +650,10 @@ async function processFiles(fileList: FileList | File[]): Promise<void> {
         }],
       });
     }
+  }
+
+  if (operationId !== inputOperationId || state.inputMode !== "json") {
+    return;
   }
 
   if (!state.accounts.length) {
@@ -612,6 +764,25 @@ function setFormat(format: string | undefined): void {
   renderAll();
 }
 
+function setInputMode(mode: string | undefined): void {
+  if (mode !== "json" && mode !== "at" && mode !== "rt") {
+    return;
+  }
+  if (state.inputMode === mode) {
+    return;
+  }
+  inputOperationId += 1;
+  state.inputMode = mode;
+  elements.input.value = "";
+  resetResults();
+  setInputStatus(
+    mode === "json"
+      ? "已切换为 JSON 输入。"
+      : "已切换为手动 " + mode.toUpperCase() + " 输入。",
+  );
+  elements.input.focus();
+}
+
 for (const button of elements.formatButtons) {
   button.addEventListener("click", () => setFormat(button.dataset.format));
   button.addEventListener("keydown", (event) => {
@@ -637,50 +808,103 @@ for (const button of elements.formatButtons) {
   });
 }
 
+for (const button of elements.inputModeButtons) {
+  button.addEventListener("click", () => setInputMode(button.dataset.inputMode));
+  button.addEventListener("keydown", (event) => {
+    const currentIndex = elements.inputModeButtons.indexOf(button);
+    let nextIndex: number | undefined;
+    if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      nextIndex = (currentIndex - 1 + elements.inputModeButtons.length)
+        % elements.inputModeButtons.length;
+    } else if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      nextIndex = (currentIndex + 1) % elements.inputModeButtons.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = elements.inputModeButtons.length - 1;
+    }
+    if (nextIndex === undefined) {
+      return;
+    }
+    event.preventDefault();
+    const nextButton = elements.inputModeButtons[nextIndex];
+    setInputMode(nextButton.dataset.inputMode);
+    nextButton.focus();
+  });
+}
+
+elements.refreshTokenVariant.addEventListener("change", () => {
+  const variant = elements.refreshTokenVariant.value;
+  if (variant !== "standard" && variant !== "mobile") {
+    return;
+  }
+  state.refreshTokenVariant = variant;
+  inputOperationId += 1;
+  resetResults();
+  if (elements.input.value.trim()) {
+    processManualTokenInput();
+  } else {
+    setInputStatus(
+      "已切换为 " + (variant === "mobile" ? "Mobile RT" : "标准 RT") + "。",
+    );
+  }
+});
+
 elements.input.addEventListener("paste", () => {
   window.setTimeout(() => {
     if (elements.input.value.trim()) {
-      processPastedInput();
+      processCurrentInput();
     }
   }, 0);
 });
 elements.input.addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
     event.preventDefault();
-    processPastedInput();
+    processCurrentInput();
   }
 });
 elements.clearAll.addEventListener("click", () => {
+  inputOperationId += 1;
   elements.input.value = "";
   resetResults();
   setInputStatus("已清空输入和转换结果。");
 });
 elements.clearResults.addEventListener("click", () => {
+  inputOperationId += 1;
   resetResults();
   setInputStatus("已清除转换结果，输入内容仍保留。");
 });
 elements.pickFiles.addEventListener("click", (event) => {
+  if (state.inputMode !== "json") {
+    return;
+  }
   event.stopPropagation();
   elements.fileInput.click();
 });
 elements.pickFolder.addEventListener("click", (event) => {
+  if (state.inputMode !== "json") {
+    return;
+  }
   event.stopPropagation();
   elements.folderInput.click();
 });
 elements.fileInput.addEventListener("change", () => {
-  if (elements.fileInput.files) {
+  if (state.inputMode === "json" && elements.fileInput.files) {
     void processFiles(elements.fileInput.files);
   }
   elements.fileInput.value = "";
 });
 elements.folderInput.addEventListener("change", () => {
-  if (elements.folderInput.files) {
+  if (state.inputMode === "json" && elements.folderInput.files) {
     void processFiles(elements.folderInput.files);
   }
   elements.folderInput.value = "";
 });
 for (const eventName of ["dragenter", "dragover"] as const) {
   elements.dropzone.addEventListener(eventName, (event) => {
+    if (state.inputMode !== "json") {
+      return;
+    }
     event.preventDefault();
     elements.dropzone.classList.add("is-dragging");
   });
@@ -692,7 +916,7 @@ for (const eventName of ["dragleave", "drop"] as const) {
   });
 }
 elements.dropzone.addEventListener("drop", (event) => {
-  if (event.dataTransfer) {
+  if (state.inputMode === "json" && event.dataTransfer) {
     void processFiles(event.dataTransfer.files);
   }
 });

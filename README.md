@@ -14,12 +14,16 @@ Vite 构建，可直接部署到 Cloudflare Pages。
 | ChatGPT Web Session | Sub2API、CPA |
 | CPA（CLIProxyAPI Codex auth JSON） | Sub2API |
 | Sub2API OpenAI OAuth 账号包 | CPA |
+| Access Token（JWT 或 `at-`） | Sub2API、CPA |
+| Refresh Token（标准或 Mobile） | Sub2API、CPA |
 
 CPA 与 Sub2API 可以双向转换，并尽可能保留原格式中的专属字段。
 
 ## 核心功能
 
 - 自动识别 Session、CPA 和 Sub2API JSON。
+- 支持逐行粘贴 AT 或 RT；JWT AT 自动解析 claims，`at-` 按 Codex Personal Access Token 处理。
+- 支持标准 RT 与 Mobile RT，并保留目标端刷新所需的 `client_id`。
 - 支持粘贴、连续 JSON、JSON 数组、多文件、目录和拖拽导入；单次最多处理 500 个 JSON、总计 50 MB。
 - 从 access token JWT claims 补齐邮箱、账号 ID、用户 ID、套餐和过期时间。
 - Sub2API 多账号合并导出。

@@ -4,11 +4,13 @@ import type {
   CpaRecord,
   DownloadDescriptor,
   JsonRecord,
+  ManualTokenType,
   NormalizedAccount,
   OutputDocument,
   OutputFormat,
   ParseCredentialResult,
   ParseIssue,
+  RefreshTokenVariant,
   Sub2ApiAccount,
   Sub2ApiDocument,
   Sub2ApiSettings,
@@ -16,6 +18,7 @@ import type {
 
 export const OPENAI_AUTH_CLAIM = "https://api.openai.com/auth";
 export const OPENAI_PROFILE_CLAIM = "https://api.openai.com/profile";
+export const OPENAI_MOBILE_RT_CLIENT_ID = "app_LlGpXReQgckcGGUo2JrYvtJK";
 
 interface CredentialCandidate {
   value: JsonRecord;
@@ -37,6 +40,12 @@ interface ParseOptions extends ConvertOptions {
   lastRefreshFallback?: unknown;
   preservedCpaFields?: JsonRecord;
   sub2ApiSettings?: Sub2ApiSettings;
+}
+
+interface ManualTokenParseOptions extends ConvertOptions {
+  maxTokens?: number;
+  refreshTokenVariant?: RefreshTokenVariant;
+  sourceName?: string;
 }
 
 const textEncoder = new TextEncoder();
@@ -818,29 +827,35 @@ export function normalizeSessionRecord(
 ): NormalizedAccount {
   const sourceType = options.sourceType ?? "chatgpt_web_session";
   const sub2ApiSettings = options.sub2ApiSettings;
+  const usesSub2ApiSettings = sourceType === "sub2api"
+    || sourceType === "manual_at"
+    || sourceType === "manual_rt";
   if (
-    sourceType === "sub2api"
+    usesSub2ApiSettings
     && sub2ApiSettings?.platform
     && sub2ApiSettings.platform.toLowerCase() !== "openai"
   ) {
     throw new Error("仅支持转换 Sub2API 中 platform=openai 的账号");
   }
   if (
-    sourceType === "sub2api"
+    usesSub2ApiSettings
     && sub2ApiSettings?.accountType
     && sub2ApiSettings.accountType.toLowerCase() !== "oauth"
   ) {
     throw new Error("仅支持转换 Sub2API 中 type=oauth 的账号");
   }
 
-  const accessToken = getAccessToken(record);
-  if (!accessToken) {
-    throw new Error("缺少 access_token / accessToken");
+  const accessToken = getAccessToken(record) ?? "";
+  const refreshToken = getRefreshToken(record);
+  const supportsRefreshOnly = sourceType === "sub2api"
+    || sourceType === "cpa"
+    || sourceType === "manual_rt";
+  if (!accessToken && !(supportsRefreshOnly && refreshToken)) {
+    throw new Error("缺少 access_token / accessToken 或 refresh_token");
   }
 
   const now = options.now ?? new Date();
   const sessionToken = getSessionToken(record);
-  const refreshToken = getRefreshToken(record);
   const inputIdToken = getIdToken(record);
   const accessPayload = parseJwtPayload(accessToken);
   const idPayload = parseJwtPayload(inputIdToken);
@@ -855,10 +870,12 @@ export function normalizeSessionRecord(
     normalizeTimestamp(record.expired),
   );
   const jwtExpiresAt = timestampFromUnixSeconds(accessPayload?.exp);
-  const tokenExpiresAt = sourceType === "chatgpt_web_session"
+  const prefersJwtExpiry = sourceType === "chatgpt_web_session"
+    || sourceType === "manual_at";
+  const tokenExpiresAt = prefersJwtExpiry
     ? firstNonEmpty(jwtExpiresAt, declaredExpiresAt)
     : firstNonEmpty(declaredExpiresAt, jwtExpiresAt);
-  const accessTokenExpiresAt = sourceType === "chatgpt_web_session"
+  const accessTokenExpiresAt = prefersJwtExpiry
     ? unixSecondsFromJwtExp(accessPayload?.exp)
       ?? unixSecondsFromValue(tokenExpiresAt)
     : unixSecondsFromValue(tokenExpiresAt)
@@ -923,7 +940,7 @@ export function normalizeSessionRecord(
   const sourceName = firstNonEmpty(options.sourceName, "粘贴内容") ?? "粘贴内容";
   const sourcePath = firstNonEmpty(options.sourcePath, "$") ?? "$";
   const sourceBase = sourceName.split(/[\\/]/u).pop();
-  const name = (sourceType === "chatgpt_web_session"
+  const name = (prefersJwtExpiry
     ? firstNonEmpty(
       email,
       record.name,
@@ -963,7 +980,9 @@ export function normalizeSessionRecord(
   );
   const warnings: string[] = [];
 
-  if (!refreshToken) {
+  const isPersonalAccessToken = sourceType === "manual_at"
+    && accessToken.startsWith("at-");
+  if (!refreshToken && !isPersonalAccessToken) {
     warnings.push("缺少 refresh_token，access token 到期后无法自动刷新。");
   }
   if (syntheticIdToken) {
@@ -1014,6 +1033,19 @@ export function normalizeSessionRecord(
   };
 }
 
+export function getAccountCredentialKeys(account: NormalizedAccount): string[] {
+  const keys: string[] = [];
+  if (account.accessToken) {
+    keys.push("at:" + account.accessToken);
+  }
+  if (account.refreshToken) {
+    keys.push("rt:" + account.refreshToken);
+  }
+  return keys.length
+    ? keys
+    : ["source:" + account.sourceName + ":" + account.sourcePath];
+}
+
 export function parseCredentialText(
   text: string,
   options: ParseOptions = {},
@@ -1021,7 +1053,7 @@ export function parseCredentialText(
   const parsed = parsePastedJsonDocuments(text);
   const accounts: NormalizedAccount[] = [];
   const issues = [...parsed.issues];
-  const seenTokens = new Set<string>();
+  const seenCredentials = new Set<string>();
   const baseName = firstNonEmpty(options.sourceName, "粘贴内容") ?? "粘贴内容";
   const now = options.now ?? new Date();
 
@@ -1055,7 +1087,8 @@ export function parseCredentialText(
           sub2ApiSettings: candidate.sub2ApiSettings,
           now,
         });
-        if (seenTokens.has(account.accessToken)) {
+        const credentialKeys = getAccountCredentialKeys(account);
+        if (credentialKeys.some((key) => seenCredentials.has(key))) {
           issues.push({
             sourceName: candidate.sourceName,
             sourcePath: candidate.sourcePath,
@@ -1063,7 +1096,7 @@ export function parseCredentialText(
           });
           continue;
         }
-        seenTokens.add(account.accessToken);
+        credentialKeys.forEach((key) => seenCredentials.add(key));
         accounts.push(account);
       } catch (error) {
         issues.push({
@@ -1078,6 +1111,151 @@ export function parseCredentialText(
   return { accounts, issues };
 }
 
+function createManualSub2ApiSettings(
+  credentials: JsonRecord,
+  extra: JsonRecord,
+  defaults: { concurrency: number; priority: number; autoPause?: boolean },
+): Sub2ApiSettings {
+  return {
+    platform: "openai",
+    accountType: "oauth",
+    concurrency: defaults.concurrency,
+    priority: defaults.priority,
+    rateMultiplier: 1,
+    autoPauseOnExpired: defaults.autoPause,
+    disabled: false,
+    credentials,
+    extra,
+    accountFields: {},
+    originalCredentialKeys: Object.keys(credentials),
+  };
+}
+
+function normalizeManualAccessToken(
+  token: string,
+  index: number,
+  options: ManualTokenParseOptions,
+): NormalizedAccount {
+  const isPersonalAccessToken = token.startsWith("at-");
+  const sourceName = options.sourceName ?? "手动 AT";
+  const account = normalizeSessionRecord({
+    access_token: token,
+    name: "OpenAI AT " + (index + 1),
+    auth_provider: isPersonalAccessToken
+      ? "codex_personal_access_token"
+      : "openai",
+  }, {
+    sourceName,
+    sourcePath: "$[" + index + "]",
+    sourceType: "manual_at",
+    now: options.now,
+  });
+
+  if (isPersonalAccessToken) {
+    const settings = createManualSub2ApiSettings({
+      access_token: token,
+      auth_mode: "personal_access_token",
+      openai_auth_mode: "personal_access_token",
+      token_type: "Bearer",
+    }, {
+      import_source: "codex_personal_access_token",
+      auth_provider: "codex_personal_access_token",
+    }, {
+      concurrency: 3,
+      priority: 50,
+      autoPause: false,
+    });
+    settings.name = account.email ?? account.name;
+    account.sub2ApiSettings = settings;
+  }
+
+  return account;
+}
+
+function normalizeManualRefreshToken(
+  token: string,
+  index: number,
+  options: ManualTokenParseOptions,
+): NormalizedAccount {
+  const variant = options.refreshTokenVariant ?? "standard";
+  const clientId = variant === "mobile"
+    ? OPENAI_MOBILE_RT_CLIENT_ID
+    : undefined;
+  const credentials = compactObject({
+    refresh_token: token,
+    client_id: clientId,
+  });
+  const settings = createManualSub2ApiSettings(credentials, {
+    auth_provider: "openai",
+    source: "manual_refresh_token",
+    refresh_token_variant: variant,
+  }, {
+    concurrency: 10,
+    priority: 1,
+  });
+  const sourceName = options.sourceName ?? "手动 RT";
+  const account = normalizeSessionRecord({
+    refresh_token: token,
+    name: "OpenAI RT " + (index + 1),
+    auth_provider: "openai",
+  }, {
+    sourceName,
+    sourcePath: "$[" + index + "]",
+    sourceType: "manual_rt",
+    preservedCpaFields: clientId ? { client_id: clientId } : undefined,
+    sub2ApiSettings: settings,
+    now: options.now,
+  });
+  settings.name = account.name;
+  account.warnings = [];
+  return account;
+}
+
+export function parseManualTokenText(
+  text: string,
+  tokenType: ManualTokenType,
+  options: ManualTokenParseOptions = {},
+): ParseCredentialResult {
+  const rawTokens = String(text || "").split(/\s+/u).filter(Boolean);
+  const maxTokens = Math.max(1, options.maxTokens ?? 500);
+  const accounts: NormalizedAccount[] = [];
+  const issues: ParseIssue[] = [];
+  const seen = new Set<string>();
+
+  if (rawTokens.length > maxTokens) {
+    issues.push({
+      sourceName: options.sourceName ?? "手动凭证",
+      reason: "一次最多处理 " + maxTokens + " 个 token，其余内容已跳过",
+    });
+  }
+
+  rawTokens.slice(0, maxTokens).forEach((token, index) => {
+    const credentialKey = tokenType + ":" + token;
+    if (seen.has(credentialKey)) {
+      issues.push({
+        sourceName: options.sourceName ?? "手动凭证",
+        sourcePath: "$[" + index + "]",
+        reason: "检测到重复凭证，已忽略",
+      });
+      return;
+    }
+    seen.add(credentialKey);
+    try {
+      accounts.push(tokenType === "at"
+        ? normalizeManualAccessToken(token, index, options)
+        : normalizeManualRefreshToken(token, index, options));
+    } catch (error) {
+      issues.push({
+        sourceName: options.sourceName ?? "手动凭证",
+        sourcePath: "$[" + index + "]",
+        reason: error instanceof Error ? error.message : "无法解析 token",
+      });
+    }
+  });
+
+  return { accounts, issues };
+}
+
 export function toCpaRecord(
   account: NormalizedAccount,
   options: ConvertOptions = {},
@@ -1085,10 +1263,13 @@ export function toCpaRecord(
   const now = options.now ?? new Date();
   const preserved = account.preservedCpaFields ?? {};
   const bridgeMetadata = account.sub2ApiSettings
-    && (account.sourceType === "sub2api" || account.sub2ApiSettings.restoredFromBridge)
     ? buildSub2ApiBridgeMetadata(account.sub2ApiSettings)
     : undefined;
-  const generatedName = account.sourceType === "sub2api" && account.email
+  const generatedName = (
+    account.sourceType === "sub2api"
+    || account.sourceType === "manual_at"
+    || account.sourceType === "manual_rt"
+  ) && account.email
     ? account.email + "_" + (account.accountId?.slice(0, 8) || "unknown")
     : undefined;
   const planType = firstNonEmpty(
@@ -1157,7 +1338,7 @@ export function toSub2ApiAccount(
   );
   const credentials = compactObject({
     ...preservedCredentials,
-    access_token: account.accessToken,
+    access_token: account.accessToken || preservedCredentials.access_token,
     chatgpt_account_id: hadCredential("chatgpt_account_id", "chatgptAccountId")
       ? account.accountId ?? preservedCredentials.chatgpt_account_id
       : undefined,

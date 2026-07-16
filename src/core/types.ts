@@ -1,5 +1,12 @@
 export type OutputFormat = "sub2api" | "cpa";
-export type AccountSourceType = "chatgpt_web_session" | "cpa" | "sub2api";
+export type AccountSourceType =
+  | "chatgpt_web_session"
+  | "cpa"
+  | "sub2api"
+  | "manual_at"
+  | "manual_rt";
+export type ManualTokenType = "at" | "rt";
+export type RefreshTokenVariant = "standard" | "mobile";
 export type JsonRecord = Record<string, unknown>;
 
 export interface Sub2ApiSettings {

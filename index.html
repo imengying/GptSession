@@ -106,7 +106,7 @@
               <div>
                 <p class="section-kicker">输入</p>
                 <h2 id="input-title">导入凭证</h2>
-                <p>粘贴 JSON，或导入一个文件、多个文件及整个目录。</p>
+                <p id="input-description">粘贴 JSON，或导入一个文件、多个文件及整个目录。</p>
               </div>
             </div>
 
@@ -114,8 +114,8 @@
               <div class="session-guide">
                 <div class="guide-icon" aria-hidden="true">i</div>
                 <div>
-                  <strong>自动识别 Session、CPA 与 Sub2API</strong>
-                  <p>
+                  <strong id="input-guide-title">自动识别 Session、CPA 与 Sub2API</strong>
+                  <p id="input-guide-description">
                     ChatGPT Session 可从
                     <a href="https://chatgpt.com/api/auth/session" target="_blank" rel="noreferrer">
                       chatgpt.com/api/auth/session
@@ -141,21 +141,55 @@
                 hidden
               />
 
-              <div class="input-actions">
-                <button class="button button-primary" id="pick-files" type="button">
-                  导入文件
-                </button>
-                <button class="button button-primary" id="pick-folder" type="button">
-                  导入目录
-                </button>
-                <button class="button button-primary" id="clear-all" type="button">
-                  清空
-                </button>
+              <div class="input-toolbar">
+                <div class="input-mode-group">
+                  <div class="input-mode-switch" role="radiogroup" aria-label="选择输入类型">
+                    <button
+                      id="input-mode-json"
+                      class="input-mode-option is-active"
+                      type="button"
+                      data-input-mode="json"
+                      role="radio"
+                      aria-checked="true"
+                    >JSON</button>
+                    <button
+                      id="input-mode-at"
+                      class="input-mode-option"
+                      type="button"
+                      data-input-mode="at"
+                      role="radio"
+                      aria-checked="false"
+                    >AT</button>
+                    <button
+                      id="input-mode-rt"
+                      class="input-mode-option"
+                      type="button"
+                      data-input-mode="rt"
+                      role="radio"
+                      aria-checked="false"
+                    >RT</button>
+                  </div>
+                  <select id="rt-variant" aria-label="Refresh Token 类型" hidden>
+                    <option value="standard">标准 RT</option>
+                    <option value="mobile">Mobile RT</option>
+                  </select>
+                </div>
+                <div class="input-actions">
+                  <button class="button button-primary" id="pick-files" type="button">
+                    导入文件
+                  </button>
+                  <button class="button button-primary" id="pick-folder" type="button">
+                    导入目录
+                  </button>
+                  <button class="button button-primary" id="clear-all" type="button">
+                    清空
+                  </button>
+                </div>
               </div>
 
               <div class="field-label">
-                <label for="session-input">JSON 内容</label>
-                <span>粘贴后自动解析 · 支持连续 JSON 与拖入文件</span>
+                <label id="input-content-label" for="session-input">JSON 内容</label>
+                <span id="input-hint">粘贴后自动解析 · 支持连续 JSON 与拖入文件</span>
               </div>
               <div class="input-drop-shell" id="dropzone">
                 <textarea

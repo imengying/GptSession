@@ -25,6 +25,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 html {
   min-height: 100%;
   background: var(--bg);
@@ -407,11 +411,71 @@ a {
   text-underline-offset: 3px;
 }
 
-.input-actions {
+.input-toolbar {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
   margin-bottom: 13px;
+}
+
+.input-mode-group,
+.input-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.input-mode-switch {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(48px, 1fr));
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.input-mode-option {
+  appearance: none;
+  min-height: 31px;
+  padding: 6px 11px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--muted);
+  background: transparent;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.input-mode-option:hover {
+  color: var(--text);
+}
+
+.input-mode-option.is-active {
+  border-color: rgba(97, 216, 255, 0.25);
+  color: var(--cyan);
+  background: rgba(97, 216, 255, 0.09);
+}
+
+.input-mode-option:focus-visible,
+#rt-variant:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+#rt-variant {
+  min-height: 39px;
+  padding: 8px 30px 8px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  color: var(--muted-strong);
+  background: #111a24;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  cursor: pointer;
 }
 
 .field-label {
@@ -795,6 +859,18 @@ tbody tr:hover:not(.empty-row) {
   background: rgba(255, 199, 107, 0.06);
 }
 
+.source-chip.source-manual_at {
+  border-color: rgba(255, 199, 107, 0.24);
+  color: var(--amber);
+  background: rgba(255, 199, 107, 0.06);
+}
+
+.source-chip.source-manual_rt {
+  border-color: rgba(120, 230, 172, 0.24);
+  color: var(--success);
+  background: rgba(120, 230, 172, 0.06);
+}
+
 .status-stack {
   display: flex;
   flex-direction: column;
@@ -1090,6 +1166,27 @@ tbody tr:hover:not(.empty-row) {
   .input-actions {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
+  }
+
+  .input-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .input-mode-group {
+    justify-content: space-between;
+  }
+
+  .input-mode-switch {
+    flex: 1;
+  }
+
+  .input-toolbar.is-token-mode .input-actions {
+    display: flex;
+  }
+
+  .input-toolbar.is-token-mode .input-actions .button {
+    width: auto;
   }
 
   .input-actions .button {
