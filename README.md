@@ -69,7 +69,7 @@ bun run preview
 | --- | --- |
 | Framework preset | `None` |
 | Production branch | `main` |
-| Build command | `bun install --frozen-lockfile && bun run build` |
+| Build command | `bun run build` |
 | Build output directory | `dist` |
 | Root directory | `/` |
 | Deploy command | 不填写 |
