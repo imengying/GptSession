@@ -3,7 +3,7 @@
 Session Bridge 是一个纯浏览器端的 ChatGPT 凭证转换工具，使用 Bun、TypeScript 和
 Vite 构建，可直接部署到 Cloudflare Pages。
 
-所有解析、转换、预览与打包均在当前浏览器内完成，凭证不会上传到服务器。
+所有解析、转换、预览与打包均在本地浏览器内完成，凭证不会上传到任何服务器。
 
 在线预览：[Session Bridge](https://elysiaya.xyz)
 
@@ -11,18 +11,18 @@ Vite 构建，可直接部署到 Cloudflare Pages。
 
 | 输入 | 可导出 |
 | --- | --- |
-| ChatGPT Web Session | sub2api、CPA |
-| CPA（CLIProxyAPI Codex auth JSON） | sub2api |
-| sub2api OpenAI OAuth 账号包 | CPA |
+| ChatGPT Web Session | Sub2API、CPA |
+| CPA（CLIProxyAPI Codex auth JSON） | Sub2API |
+| Sub2API OpenAI OAuth 账号包 | CPA |
 
-CPA 与 sub2api 可以双向转换，并尽可能保留原格式中的专属字段。
+CPA 与 Sub2API 可以双向转换，并尽可能保留原格式中的专属字段。
 
 ## 核心功能
 
-- 自动识别 Session、CPA 和 sub2api JSON。
-- 支持粘贴、连续 JSON、JSON 数组、多文件、目录和拖拽导入。
+- 自动识别 Session、CPA 和 Sub2API JSON。
+- 支持粘贴、连续 JSON、JSON 数组、多文件、目录和拖拽导入；单次最多处理 500 个 JSON、总计 50 MB。
 - 从 access token JWT claims 补齐邮箱、账号 ID、用户 ID、套餐和过期时间。
-- sub2api 多账号合并导出。
+- Sub2API 多账号合并导出。
 - CPA 单账号 JSON 与多账号 ZIP 导出。
 - 默认脱敏 token、password、client_secret 等敏感字段。
 - 预览使用脱敏数据，复制和下载使用完整 JSON。
@@ -103,6 +103,7 @@ src/core/redaction.ts      预览敏感字段脱敏
 src/core/zip.ts            无依赖 ZIP 打包
 public/_headers            Cloudflare Pages 安全响应头
 scripts/check-build.ts     生产构建完整性与隐私边界检查
+tests/core.test.ts         解析、互转、脱敏与 ZIP 回归测试
 ```
 
 ## License

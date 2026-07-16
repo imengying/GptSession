@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="在浏览器本地转换 ChatGPT Web Session、sub2api 与 CPA 凭证文件。"
+      content="在浏览器本地转换 ChatGPT Web Session、Sub2API 与 CPA 凭证文件。"
     />
     <meta name="theme-color" content="#0b111a" />
     <meta name="color-scheme" content="dark" />
@@ -50,12 +50,12 @@
       <section class="hero">
         <div class="hero-copy">
           <p class="hero-lead">
-            导入 ChatGPT Web Session、sub2api 或 CPA 凭证，转换、预览与打包均在当前浏览器内存中完成。
+            导入 ChatGPT Web Session、Sub2API 或 CPA 凭证，转换、预览与打包均在当前浏览器内存中完成。
           </p>
           <div class="hero-pills" aria-label="当前能力">
-            <span>Session → sub2api</span>
+            <span>Session → Sub2API</span>
             <span>Session → CPA</span>
-            <span>CPA ↔ sub2api</span>
+            <span>CPA ↔ Sub2API</span>
             <span>CPA 批量 ZIP</span>
           </div>
         </div>
@@ -75,7 +75,7 @@
               aria-controls="output-panel"
             >
               <span>导出为</span>
-              <strong>sub2api</strong>
+              <strong>Sub2API</strong>
             </button>
             <button
               id="format-cpa"
@@ -114,7 +114,7 @@
               <div class="session-guide">
                 <div class="guide-icon" aria-hidden="true">i</div>
                 <div>
-                  <strong>自动识别 Session、CPA 与 sub2api</strong>
+                  <strong>自动识别 Session、CPA 与 Sub2API</strong>
                   <p>
                     ChatGPT Session 可从
                     <a href="https://chatgpt.com/api/auth/session" target="_blank" rel="noreferrer">
@@ -174,7 +174,7 @@
 
               <div class="status-bar" id="input-status" aria-live="polite">
                 <span class="status-light"></span>
-                等待导入 Session、CPA 或 sub2api JSON。
+                等待导入 Session、CPA 或 Sub2API JSON。
               </div>
             </div>
           </section>
@@ -188,9 +188,9 @@
             <div class="panel-head">
               <div>
                 <p class="section-kicker">输出</p>
-                <h2 id="output-title">sub2api 导入包</h2>
+                <h2 id="output-title">Sub2API 认证文件</h2>
                 <p id="format-description">
-                  将 Session 或 CPA 凭证转换为 sub2api 批量导入结构。
+                  将导入的凭证转换为所选认证格式，并保留可恢复的 token、账号信息与过期时间。
                 </p>
               </div>
               <span class="preview-badge" id="preview-badge">已脱敏预览</span>
@@ -270,6 +270,7 @@
               <textarea
                 class="output-preview"
                 id="output-preview"
+                aria-label="转换结果预览"
                 readonly
                 spellcheck="false"
                 placeholder="转换结果将在这里预览。"

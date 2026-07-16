@@ -4,6 +4,9 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    modulePreload: {
+      polyfill: false,
+    },
     target: "es2022",
   },
   preview: {

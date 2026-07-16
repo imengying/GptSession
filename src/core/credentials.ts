@@ -88,6 +88,7 @@ const ID_TOKEN_PATHS = [
 
 const SESSION_BRIDGE_KEY = "session_bridge";
 const SESSION_BRIDGE_SCHEMA = 1;
+const MAX_CPA_FILE_TOKEN_BYTES = 240;
 
 function isPlainObject(value: unknown): value is JsonRecord {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -243,15 +244,41 @@ function toEmailKey(email?: string): string | undefined {
     .replace(/^_+|_+$/g, "") || undefined;
 }
 
+function truncateUtf8(value: string, maxBytes: number): string {
+  const bytes = textEncoder.encode(value);
+  if (bytes.length <= maxBytes) {
+    return value;
+  }
+  let end = maxBytes;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) {
+    end -= 1;
+  }
+  return textDecoder.decode(bytes.subarray(0, end));
+}
+
+function fitFileToken(value: string, maxBytes: number): string {
+  if (textEncoder.encode(value).length <= maxBytes) {
+    return value;
+  }
+  const atIndex = value.lastIndexOf("@");
+  if (atIndex > 0) {
+    const domain = value.slice(atIndex);
+    const domainBytes = textEncoder.encode(domain).length;
+    if (domainBytes < maxBytes) {
+      return truncateUtf8(value.slice(0, atIndex), maxBytes - domainBytes)
+        + domain;
+    }
+  }
+  return truncateUtf8(value, maxBytes);
+}
+
 function sanitizeFileToken(value: unknown, fallback = "chatgpt-account"): string {
   const base = firstNonEmpty(value, fallback) ?? fallback;
-  return base
+  const sanitized = base
     .replace(/[\\/:*?"<>|]+/g, "-")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .toLowerCase()
-    .slice(0, 80) || fallback;
+    .replace(/[\u0000-\u001f\u007f]+/g, "-")
+    .replace(/[. ]+$/g, "") || fallback;
+  return fitFileToken(sanitized, MAX_CPA_FILE_TOKEN_BYTES) || fallback;
 }
 
 function getTimestampToken(date: Date): string {
@@ -796,14 +823,14 @@ export function normalizeSessionRecord(
     && sub2ApiSettings?.platform
     && sub2ApiSettings.platform.toLowerCase() !== "openai"
   ) {
-    throw new Error("仅支持转换 sub2api 中 platform=openai 的账号");
+    throw new Error("仅支持转换 Sub2API 中 platform=openai 的账号");
   }
   if (
     sourceType === "sub2api"
     && sub2ApiSettings?.accountType
     && sub2ApiSettings.accountType.toLowerCase() !== "oauth"
   ) {
-    throw new Error("仅支持转换 sub2api 中 type=oauth 的账号");
+    throw new Error("仅支持转换 Sub2API 中 type=oauth 的账号");
   }
 
   const accessToken = getAccessToken(record);
@@ -1006,7 +1033,7 @@ export function parseCredentialText(
     if (!candidates.length) {
       issues.push({
         sourceName: documentLabel,
-        reason: "未找到可识别的 Session、CPA 或 sub2api 账号",
+        reason: "未找到可识别的 Session、CPA 或 Sub2API 账号",
       });
       return;
     }
@@ -1212,22 +1239,106 @@ export function toSub2ApiAccount(
   }) as unknown as Sub2ApiAccount;
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return "[" + value.map((item) => canonicalJson(item)).join(",") + "]";
+  }
+  if (isPlainObject(value)) {
+    return "{" + Object.keys(value).sort().map((key) => (
+      JSON.stringify(key) + ":" + canonicalJson(value[key])
+    )).join(",") + "}";
+  }
+  return JSON.stringify(value) ?? String(value);
+}
+
+function getDistinctSub2ApiDocumentFields(
+  accounts: NormalizedAccount[],
+): JsonRecord[] {
+  const documents: JsonRecord[] = [];
+  const seen = new Set<string>();
+  for (const account of accounts) {
+    const document = account.sub2ApiSettings?.documentFields;
+    if (!document) {
+      continue;
+    }
+    const signature = canonicalJson(document);
+    if (!seen.has(signature)) {
+      seen.add(signature);
+      documents.push(document);
+    }
+  }
+  return documents;
+}
+
+export function getSub2ApiDocumentConflicts(
+  accounts: NormalizedAccount[],
+): string[] {
+  const documents = getDistinctSub2ApiDocumentFields(accounts);
+  const keys = new Set(documents.flatMap((document) => Object.keys(document)));
+  keys.delete("exported_at");
+  keys.delete("proxies");
+  return [...keys].filter((key) => {
+    const values = documents
+      .filter((document) => document[key] !== undefined)
+      .map((document) => canonicalJson(document[key]));
+    return new Set(values).size > 1;
+  }).sort();
+}
+
+function mergeSub2ApiDocumentFields(documents: JsonRecord[]): JsonRecord {
+  const merged: JsonRecord = {};
+  const keys = new Set(documents.flatMap((document) => Object.keys(document)));
+  keys.delete("accounts");
+  keys.delete("exported_at");
+  keys.delete("proxies");
+
+  for (const key of keys) {
+    const values = documents
+      .filter((document) => document[key] !== undefined)
+      .map((document) => document[key]);
+    if (!values.length) {
+      continue;
+    }
+    const signatures = new Set(values.map((value) => canonicalJson(value)));
+    if (signatures.size === 1) {
+      merged[key] = values[0];
+    }
+  }
+
+  const proxies: unknown[] = [];
+  const seenProxies = new Set<string>();
+  for (const document of documents) {
+    if (!Array.isArray(document.proxies)) {
+      continue;
+    }
+    for (const proxy of document.proxies) {
+      const signature = canonicalJson(proxy);
+      if (!seenProxies.has(signature)) {
+        seenProxies.add(signature);
+        proxies.push(proxy);
+      }
+    }
+  }
+  merged.proxies = proxies;
+  return merged;
+}
+
 export function buildSub2ApiDocument(
   accounts: NormalizedAccount[],
   options: ConvertOptions = {},
 ): Sub2ApiDocument {
   const now = options.now ?? new Date();
-  const documentFields = accounts.find(
-    (account) => account.sub2ApiSettings?.documentFields,
-  )?.sub2ApiSettings?.documentFields;
+  const documents = getDistinctSub2ApiDocumentFields(accounts);
+  const documentFields = mergeSub2ApiDocumentFields(documents);
+  const preservedExportedAt = documents.length === 1
+    ? firstNonEmpty(documents[0].exported_at)
+    : undefined;
   return {
-    ...(documentFields ?? {}),
-    exported_at: firstNonEmpty(documentFields?.exported_at)
+    ...documentFields,
+    exported_at: preservedExportedAt
       ?? normalizeTimestamp(now)
       ?? now.toISOString(),
-    proxies: Array.isArray(documentFields?.proxies)
-      ? documentFields.proxies
-      : [],
+    proxies: documentFields.proxies as unknown[],
     accounts: accounts.map((account) => toSub2ApiAccount(account, { now })),
   };
 }

@@ -3,6 +3,15 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const collectFiles = (directory: string, extension: string): string[] => (
+  readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const filePath = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      return collectFiles(filePath, extension);
+    }
+    return entry.isFile() && entry.name.endsWith(extension) ? [filePath] : [];
+  })
+);
 const requiredFiles = [
   "dist/index.html",
   "dist/_headers",
@@ -29,13 +38,14 @@ if (!assetFiles.some((file) => file.endsWith(".css"))) {
   process.exit(1);
 }
 
-const source = [
-  "src/core/credentials.ts",
-  "src/core/redaction.ts",
-  "src/core/zip.ts",
-  "src/app.ts",
-].map((relativePath) => (
-  readFileSync(join(root, relativePath), "utf8")
+const runtimeFiles = [
+  ...collectFiles(join(root, "src"), ".ts"),
+  ...assetFiles
+    .filter((file) => file.endsWith(".js"))
+    .map((file) => join(root, "dist/assets", file)),
+];
+const source = runtimeFiles.map((filePath) => (
+  readFileSync(filePath, "utf8")
 )).join("\n");
 const forbiddenRuntimeApis = [
   { label: "fetch", pattern: /\bfetch\s*\(/u },

@@ -462,7 +462,8 @@ textarea {
   padding: 17px;
 }
 
-#session-input:focus {
+#session-input:focus,
+.output-preview:focus-visible {
   border-color: rgba(97, 216, 255, 0.42);
   box-shadow: 0 0 0 4px rgba(97, 216, 255, 0.055);
 }

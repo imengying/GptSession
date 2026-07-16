@@ -40,31 +40,31 @@ function normalizeFileName(fileName: string): string {
     .replaceAll("\\", "/")
     .replace(/^\/+/, "")
     .split("/")
-    .filter(Boolean)
+    .filter((segment) => (
+      Boolean(segment) && segment !== "." && segment !== ".."
+    ))
     .join("/") || "file.json";
 }
 
 function getUniqueEntries(entries: ArchiveEntry[]): BinaryArchiveEntry[] {
-  const counts = new Map<string, number>();
+  const usedNames = new Set<string>();
   return entries.map((entry, index) => {
     const rawName = normalizeFileName(
       entry.fileName || "file-" + (index + 1) + ".json",
     );
-    const count = counts.get(rawName) ?? 0;
-    counts.set(rawName, count + 1);
-    if (!count) {
-      return {
-        fileName: rawName,
-        bytes: textEncoder.encode(String(entry.text ?? "")),
-      };
-    }
-
     const dotIndex = rawName.lastIndexOf(".");
     const hasExtension = dotIndex > 0;
     const baseName = hasExtension ? rawName.slice(0, dotIndex) : rawName;
     const extension = hasExtension ? rawName.slice(dotIndex) : "";
+    let fileName = rawName;
+    let suffix = 2;
+    while (usedNames.has(fileName.toLowerCase())) {
+      fileName = baseName + "-" + suffix + extension;
+      suffix += 1;
+    }
+    usedNames.add(fileName.toLowerCase());
     return {
-      fileName: baseName + "-" + (count + 1) + extension,
+      fileName,
       bytes: textEncoder.encode(String(entry.text ?? "")),
     };
   });

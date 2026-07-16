@@ -2,6 +2,7 @@ import {
   buildZipArchive,
   buildOutputDocument,
   getDownloadDescriptor,
+  getSub2ApiDocumentConflicts,
   parseCredentialText,
   redactSensitiveDocument,
   type AccountSourceType,
@@ -68,13 +69,14 @@ const elements = {
 };
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const MAX_TOTAL_IMPORT_SIZE = 50 * 1024 * 1024;
 const MAX_FILES = 500;
 let toastTimer: number | undefined;
 
 const SOURCE_LABELS: Record<AccountSourceType, string> = {
   chatgpt_web_session: "SESSION",
   cpa: "CPA",
-  sub2api: "SUB2API",
+  sub2api: "Sub2API",
 };
 
 function escapeHtml(value: unknown): string {
@@ -148,10 +150,25 @@ function showToast(message: string, tone?: "error"): void {
 }
 
 function getWarningCount(): number {
-  return state.issues.length + state.accounts.reduce(
+  return state.issues.length + getFormatIssues().length + state.accounts.reduce(
     (total, account) => total + account.warnings.length,
     0,
   );
+}
+
+function getFormatIssues(): ParseIssue[] {
+  if (state.format !== "sub2api") {
+    return [];
+  }
+  const conflicts = getSub2ApiDocumentConflicts(state.accounts);
+  if (!conflicts.length) {
+    return [];
+  }
+  return [{
+    sourceName: "Sub2API 合并导出",
+    reason: "多个导入包的顶层字段存在冲突，已从合并结果中省略："
+      + conflicts.join("、"),
+  }];
 }
 
 function getExportDate(): Date {
@@ -181,18 +198,16 @@ function renderFormatControls(): void {
     }
   }
 
+  elements.formatDescription.textContent =
+    "将导入的凭证转换为所选认证格式，并保留可恢复的 token、账号信息与过期时间。";
+
   if (state.format === "cpa") {
     elements.outputTitle.textContent = "CPA 认证文件";
-    elements.formatDescription.textContent = state.accounts.length > 1
-      ? "将 Session 或 sub2api 账号转换为独立 Codex CPA JSON；批量下载时自动打包为 ZIP。"
-      : "生成 Codex CPA auth JSON，并保留可恢复的 token、账号信息与过期时间。";
     elements.downloadOutput.textContent = state.accounts.length > 1
       ? "下载 ZIP"
       : "下载 JSON";
   } else {
-    elements.outputTitle.textContent = "sub2api 导入包";
-    elements.formatDescription.textContent =
-      "将 Session 或 CPA 凭证转换为 exported_at / proxies / accounts 批量导入结构。";
+    elements.outputTitle.textContent = "Sub2API 认证文件";
     elements.downloadOutput.textContent = "下载 JSON";
   }
 }
@@ -316,7 +331,8 @@ function renderAccounts(): void {
 }
 
 function renderIssues(): void {
-  const entries: ParseIssue[] = [...state.issues];
+  const formatIssues = getFormatIssues();
+  const entries: ParseIssue[] = [...state.issues, ...formatIssues];
   for (const account of state.accounts) {
     for (const warning of account.warnings) {
       entries.push({
@@ -341,7 +357,7 @@ function renderIssues(): void {
       : "";
     return `<li><strong>${escapeHtml(issue.sourceName + location)}</strong> — ${escapeHtml(issue.reason)}</li>`;
   }).join("");
-  if (!state.accounts.length || state.issues.length) {
+  if (!state.accounts.length || state.issues.length || formatIssues.length) {
     elements.issuesBox.open = true;
   }
 }
@@ -403,8 +419,13 @@ function mergeParsedResult(
 function processPastedInput(): void {
   const text = elements.input.value;
   if (!text.trim()) {
-    setInputStatus("请先粘贴 Session、CPA 或 sub2api JSON。", "error");
+    setInputStatus("请先粘贴 Session、CPA 或 Sub2API JSON。", "error");
     showToast("没有可解析的输入", "error");
+    return;
+  }
+  if (new Blob([text]).size > MAX_TOTAL_IMPORT_SIZE) {
+    setInputStatus("粘贴内容超过 50 MB，请拆分后再导入。", "error");
+    showToast("粘贴内容过大", "error");
     return;
   }
   setInputStatus("正在本地解析粘贴内容…", "working");
@@ -430,48 +451,58 @@ function processPastedInput(): void {
 
 async function processFiles(fileList: FileList | File[]): Promise<void> {
   const allFiles = Array.from(fileList);
-  const jsonFiles = allFiles
-    .filter((file) => file.name.toLowerCase().endsWith(".json"))
-    .slice(0, MAX_FILES);
-  if (!jsonFiles.length) {
+  const jsonCandidates = allFiles.filter(
+    (file) => file.name.toLowerCase().endsWith(".json"),
+  );
+  if (!jsonCandidates.length) {
     setInputStatus("没有找到 JSON 文件。", "error");
     showToast("请选择 JSON 文件", "error");
     return;
   }
+  const jsonFiles = jsonCandidates.slice(0, MAX_FILES);
 
   setInputStatus(
     "正在读取并解析 " + jsonFiles.length + " 个文件…",
     "working",
   );
   const oversizedIssues: ParseIssue[] = [];
-  const readableFiles = jsonFiles.filter((file) => {
-    if (file.size <= MAX_FILE_SIZE) {
-      return true;
+  const readableFiles: File[] = [];
+  let totalSize = 0;
+  let skippedForTotalSize = false;
+  for (const file of jsonFiles) {
+    if (file.size > MAX_FILE_SIZE) {
+      oversizedIssues.push({
+        sourceName: file.webkitRelativePath || file.name,
+        reason: "文件超过 10 MB，已跳过",
+      });
+      continue;
     }
-    oversizedIssues.push({
-      sourceName: file.webkitRelativePath || file.name,
-      reason: "文件超过 10 MB，已跳过",
-    });
-    return false;
-  });
+    if (totalSize + file.size > MAX_TOTAL_IMPORT_SIZE) {
+      skippedForTotalSize = true;
+      continue;
+    }
+    totalSize += file.size;
+    readableFiles.push(file);
+  }
 
-  const results = await Promise.all(readableFiles.map(async (file) => {
+  const results: ReturnType<typeof parseCredentialText>[] = [];
+  for (const file of readableFiles) {
     const sourceName = file.webkitRelativePath || file.name;
     try {
-      return parseCredentialText(await file.text(), {
+      results.push(parseCredentialText(await file.text(), {
         sourceName,
         now: new Date(),
-      });
+      }));
     } catch (error) {
-      return {
+      results.push({
         accounts: [],
         issues: [{
           sourceName,
           reason: error instanceof Error ? error.message : "无法读取文件",
         }],
-      };
+      });
     }
-  }));
+  }
 
   if (!state.accounts.length) {
     autoSelectOutput(results.flatMap((result) => result.accounts));
@@ -480,7 +511,13 @@ async function processFiles(fileList: FileList | File[]): Promise<void> {
     mergeParsedResult(result, false);
   }
   state.issues.push(...oversizedIssues);
-  if (allFiles.length > MAX_FILES) {
+  if (skippedForTotalSize) {
+    state.issues.push({
+      sourceName: "文件导入",
+      reason: "导入文件总大小超过 50 MB，超出部分已跳过",
+    });
+  }
+  if (jsonCandidates.length > MAX_FILES) {
     state.issues.push({
       sourceName: "文件导入",
       reason: "一次最多处理 " + MAX_FILES + " 个文件，其余文件已跳过",
@@ -491,7 +528,7 @@ async function processFiles(fileList: FileList | File[]): Promise<void> {
     state.accounts.length
       ? "文件解析完成：当前共有 " + state.accounts.length
         + " 个可导出账号，" + getWarningCount() + " 条提示。"
-      : "文件中未找到可导出的 Session、CPA 或 sub2api 账号。",
+      : "文件中未找到可导出的 Session、CPA 或 Sub2API 账号。",
     state.accounts.length ? "success" : "error",
   );
 }
