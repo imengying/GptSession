@@ -183,7 +183,7 @@ function getFormatIssues(): ParseIssue[] {
   ) {
     issues.push({
       sourceName: "CPA RT 导出",
-      reason: "部分凭证仅包含 refresh_token，access_token 与账号信息需由目标端刷新后补齐",
+      reason: "部分凭证仅包含 refresh_token；导入 CPA 后需联网刷新，才能生成 access_token 与账号信息",
     });
   }
   if (state.format === "sub2api") {
@@ -245,7 +245,7 @@ function renderInputControls(): void {
       "手动粘贴 Refresh Token，支持批量生成 Sub2API 或 CPA 凭证。";
     elements.inputGuideTitle.textContent = "手动输入 Refresh Token";
     elements.inputGuideDescription.textContent =
-      "RT 不会在本地验证；邮箱、账号 ID 与 Access Token 需由目标端刷新后补齐。";
+      "RT 不会在本地验证；导入目标端后需联网换取 Access Token 并补齐账号信息。";
     elements.inputContentLabel.textContent = "Refresh Token";
     elements.inputHint.textContent = "每行一个 · 自动去重 · 不联网验证";
     elements.input.placeholder = "每行粘贴一个 Refresh Token";

@@ -1248,6 +1248,10 @@ export function toCpaRecord(
 ): CpaRecord {
   const now = options.now ?? new Date();
   const preserved = account.preservedCpaFields ?? {};
+  const needsInitialRefresh = !account.accessToken && Boolean(account.refreshToken);
+  const expired = needsInitialRefresh
+    ? new Date(now.getTime() - 60_000).toISOString()
+    : account.exportExpiresAt ?? normalizeTimestamp(preserved.expired);
   const bridgeMetadata = account.sub2ApiSettings
     ? buildSub2ApiBridgeMetadata(account.sub2ApiSettings)
     : undefined;
@@ -1286,7 +1290,8 @@ export function toCpaRecord(
     refresh_token: firstNonEmpty(account.refreshToken, preserved.refresh_token) ?? "",
     session_token: firstNonEmpty(account.sessionToken, preserved.session_token) ?? "",
     last_refresh: account.lastRefresh || normalizeTimestamp(now),
-    expired: account.exportExpiresAt ?? normalizeTimestamp(preserved.expired),
+    // RT-only files need an expired deadline so CLIProxyAPI refreshes them immediately.
+    expired,
     disabled: account.disabled || readBoolean(preserved.disabled) || undefined,
     source: firstNonEmpty(
       preserved.source,

@@ -390,6 +390,7 @@ describe("Manual AT and RT input", () => {
       refresh_token: "rt-refresh-token",
       id_token: "",
       id_token_synthetic: false,
+      expired: "2026-07-16T03:59:00.000Z",
     });
 
     const sub2ApiRoundTrip = parseCredentialText(JSON.stringify(
