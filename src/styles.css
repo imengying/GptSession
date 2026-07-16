@@ -460,22 +460,9 @@ a {
   background: rgba(97, 216, 255, 0.09);
 }
 
-.input-mode-option:focus-visible,
-#rt-variant:focus-visible {
+.input-mode-option:focus-visible {
   outline: 2px solid var(--cyan);
   outline-offset: 2px;
-}
-
-#rt-variant {
-  min-height: 39px;
-  padding: 8px 30px 8px 11px;
-  border: 1px solid var(--line-strong);
-  border-radius: 10px;
-  color: var(--muted-strong);
-  background: #111a24;
-  font-family: var(--mono);
-  font-size: 0.65rem;
-  cursor: pointer;
 }
 
 .field-label {

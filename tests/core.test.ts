@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 
 import {
   OPENAI_AUTH_CLAIM,
-  OPENAI_MOBILE_RT_CLIENT_ID,
   OPENAI_PROFILE_CLAIM,
   buildZipArchive,
   buildCpaDocument,
@@ -320,8 +319,8 @@ describe("CPA export", () => {
 });
 
 describe("Manual AT and RT input", () => {
-  test("parses JWT AT claims and exports a complete CPA record", () => {
-    const accessToken = jwt({
+  test("rejects JWT and other non-at manual access tokens", () => {
+    const jwtAccessToken = jwt({
       exp: EXPIRY,
       email: "manual-at@example.com",
       [OPENAI_AUTH_CLAIM]: {
@@ -330,41 +329,26 @@ describe("Manual AT and RT input", () => {
         chatgpt_user_id: "manual-at-user",
       },
     });
-    const parsed = parseManualTokenText(
-      accessToken + "\n" + accessToken,
-      "at",
-      { now: NOW },
-    );
-    const cpa = toCpaRecord(parsed.accounts[0], { now: NOW });
-
-    expect(parsed.accounts).toHaveLength(1);
-    expect(parsed.issues).toHaveLength(1);
-    expect(parsed.issues[0].reason).toContain("重复");
-    expect(parsed.accounts[0]).toMatchObject({
-      sourceType: "manual_at",
-      email: "manual-at@example.com",
-      accountId: "manual-at-account",
-      planType: "plus",
-      accessToken,
+    const parsed = parseManualTokenText(jwtAccessToken + "\nat-\nsk-other", "at", {
+      now: NOW,
     });
-    expect(cpa).toMatchObject({
-      type: "codex",
-      email: "manual-at@example.com",
-      account_id: "manual-at-account",
-      plan_type: "plus",
-      access_token: accessToken,
-      refresh_token: "",
-      expired: new Date(EXPIRY * 1000).toISOString(),
-      id_token_synthetic: true,
+
+    expect(parsed.accounts).toHaveLength(0);
+    expect(parsed.issues).toHaveLength(3);
+    parsed.issues.forEach((issue) => {
+      expect(issue.reason).toContain("仅支持 at- 开头");
     });
   });
 
   test("marks at- tokens as Sub2API personal access tokens", () => {
     const token = "at-personal-access-token";
-    const parsed = parseManualTokenText(token, "at", { now: NOW });
+    const parsed = parseManualTokenText(token + "\n" + token, "at", { now: NOW });
     const sub2api = toSub2ApiAccount(parsed.accounts[0], { now: NOW });
     const cpa = toCpaRecord(parsed.accounts[0], { now: NOW });
 
+    expect(parsed.accounts).toHaveLength(1);
+    expect(parsed.issues).toHaveLength(1);
+    expect(parsed.issues[0].reason).toContain("重复");
     expect(sub2api).toMatchObject({
       platform: "openai",
       type: "oauth",
@@ -383,65 +367,47 @@ describe("Manual AT and RT input", () => {
     expect(cpa.refresh_token).toBe("");
   });
 
-  test("exports standard and Mobile RT to both Sub2API and CPA", () => {
-    const standard = parseManualTokenText("rt-standard", "rt", {
+  test("exports RT to both Sub2API and CPA", () => {
+    const parsed = parseManualTokenText("rt-refresh-token", "rt", {
       now: NOW,
-      refreshTokenVariant: "standard",
     });
-    const mobile = parseManualTokenText("rt-mobile", "rt", {
-      now: NOW,
-      refreshTokenVariant: "mobile",
-    });
-    const standardSub2Api = toSub2ApiAccount(standard.accounts[0], { now: NOW });
-    const mobileSub2Api = toSub2ApiAccount(mobile.accounts[0], { now: NOW });
-    const standardCpa = toCpaRecord(standard.accounts[0], { now: NOW });
-    const mobileCpa = toCpaRecord(mobile.accounts[0], { now: NOW });
+    const sub2Api = toSub2ApiAccount(parsed.accounts[0], { now: NOW });
+    const cpa = toCpaRecord(parsed.accounts[0], { now: NOW });
 
-    expect(standard.accounts[0]).toMatchObject({
+    expect(parsed.accounts[0]).toMatchObject({
       sourceType: "manual_rt",
       accessToken: "",
-      refreshToken: "rt-standard",
+      refreshToken: "rt-refresh-token",
       isRefreshable: true,
       warnings: [],
     });
-    expect(standardSub2Api.credentials.access_token).toBeUndefined();
-    expect(standardSub2Api.credentials.refresh_token).toBe("rt-standard");
-    expect(standardSub2Api.credentials.client_id).toBeUndefined();
-    expect(mobileSub2Api.credentials).toMatchObject({
-      refresh_token: "rt-mobile",
-      client_id: OPENAI_MOBILE_RT_CLIENT_ID,
+    expect(sub2Api.credentials).toEqual({
+      refresh_token: "rt-refresh-token",
     });
-    expect(standardCpa).toMatchObject({
+    expect(cpa).toMatchObject({
       type: "codex",
       access_token: "",
-      refresh_token: "rt-standard",
+      refresh_token: "rt-refresh-token",
       id_token: "",
       id_token_synthetic: false,
     });
-    expect(mobileCpa).toMatchObject({
-      access_token: "",
-      refresh_token: "rt-mobile",
-      client_id: OPENAI_MOBILE_RT_CLIENT_ID,
-    });
 
     const sub2ApiRoundTrip = parseCredentialText(JSON.stringify(
-      buildSub2ApiDocument(mobile.accounts, { now: NOW }),
+      buildSub2ApiDocument(parsed.accounts, { now: NOW }),
     ), { now: NOW });
     expect(sub2ApiRoundTrip.issues).toHaveLength(0);
     expect(sub2ApiRoundTrip.accounts[0]).toMatchObject({
       accessToken: "",
-      refreshToken: "rt-mobile",
+      refreshToken: "rt-refresh-token",
       isRefreshable: true,
     });
 
-    const restored = parseCredentialText(JSON.stringify(mobileCpa), { now: NOW });
+    const restored = parseCredentialText(JSON.stringify(cpa), { now: NOW });
     const restoredSub2Api = buildSub2ApiDocument(restored.accounts, { now: NOW });
     expect(restored.issues).toHaveLength(0);
-    expect(restoredSub2Api.accounts[0].credentials).toMatchObject({
-      refresh_token: "rt-mobile",
-      client_id: OPENAI_MOBILE_RT_CLIENT_ID,
+    expect(restoredSub2Api.accounts[0].credentials).toEqual({
+      refresh_token: "rt-refresh-token",
     });
-    expect(restoredSub2Api.accounts[0].credentials.access_token).toBeUndefined();
   });
 
   test("limits manual token batches to 500 entries", () => {
@@ -593,6 +559,36 @@ describe("CPA and Sub2API exchange", () => {
       rate_multiplier: 1.5,
       auto_pause_on_expired: true,
       expires_at: EXPIRY,
+    });
+  });
+
+  test("preserves an imported optional client_id without classifying the RT", () => {
+    const original = {
+      exported_at: NOW.toISOString(),
+      proxies: [],
+      accounts: [{
+        name: "refresh-token-account",
+        platform: "openai",
+        type: "oauth",
+        concurrency: 10,
+        priority: 1,
+        credentials: {
+          refresh_token: "existing-refresh-token",
+          client_id: "existing-client-id",
+        },
+        extra: {},
+      }],
+    };
+    const first = parseCredentialText(JSON.stringify(original), { now: NOW });
+    const cpa = toCpaRecord(first.accounts[0], { now: NOW });
+    const second = parseCredentialText(JSON.stringify(cpa), { now: NOW });
+    const restored = toSub2ApiAccount(second.accounts[0], { now: NOW });
+
+    expect(first.issues).toHaveLength(0);
+    expect(second.issues).toHaveLength(0);
+    expect(restored.credentials).toMatchObject({
+      refresh_token: "existing-refresh-token",
+      client_id: "existing-client-id",
     });
   });
 

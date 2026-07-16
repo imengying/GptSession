@@ -14,7 +14,6 @@ import {
   type OutputDocument,
   type OutputFormat,
   type ParseIssue,
-  type RefreshTokenVariant,
 } from "./core";
 
 type InputMode = "json" | ManualTokenType;
@@ -22,7 +21,6 @@ type InputMode = "json" | ManualTokenType;
 interface AppState {
   format: OutputFormat;
   inputMode: InputMode;
-  refreshTokenVariant: RefreshTokenVariant;
   accounts: NormalizedAccount[];
   issues: ParseIssue[];
   revealSecrets: boolean;
@@ -32,7 +30,6 @@ interface AppState {
 const state: AppState = {
   format: "sub2api",
   inputMode: "json",
-  refreshTokenVariant: "standard",
   accounts: [],
   issues: [],
   revealSecrets: false,
@@ -80,7 +77,6 @@ const elements = {
   pickFiles: element<HTMLButtonElement>("#pick-files"),
   pickFolder: element<HTMLButtonElement>("#pick-folder"),
   previewBadge: element<HTMLElement>("#preview-badge"),
-  refreshTokenVariant: element<HTMLSelectElement>("#rt-variant"),
   statAccounts: element<HTMLElement>("#stat-accounts"),
   statIssues: element<HTMLElement>("#stat-issues"),
   statRefreshable: element<HTMLElement>("#stat-refreshable"),
@@ -231,18 +227,16 @@ function renderInputControls(): void {
   elements.inputToolbar.classList.toggle("is-token-mode", tokenMode);
   elements.pickFiles.hidden = tokenMode;
   elements.pickFolder.hidden = tokenMode;
-  elements.refreshTokenVariant.hidden = state.inputMode !== "rt";
-  elements.refreshTokenVariant.value = state.refreshTokenVariant;
 
   if (state.inputMode === "at") {
     elements.inputDescription.textContent =
-      "手动粘贴 Access Token，支持批量生成 Sub2API 或 CPA 凭证。";
+      "手动粘贴 at- 开头的 Access Token，支持批量生成 Sub2API 或 CPA 凭证。";
     elements.inputGuideTitle.textContent = "手动输入 Access Token";
     elements.inputGuideDescription.textContent =
-      "JWT AT 会自动解析账号与过期信息；at- token 将按 Codex Personal Access Token 导出。";
-    elements.inputContentLabel.textContent = "Access Token";
+      "仅支持 at- token，并按 Codex Personal Access Token 导出。";
+    elements.inputContentLabel.textContent = "Access Token（at-）";
     elements.inputHint.textContent = "每行一个 · 自动去重 · 不联网验证";
-    elements.input.placeholder = "eyJ...\nat-...";
+    elements.input.placeholder = "at-...";
     return;
   }
 
@@ -253,7 +247,7 @@ function renderInputControls(): void {
     elements.inputGuideDescription.textContent =
       "RT 不会在本地验证；邮箱、账号 ID 与 Access Token 需由目标端刷新后补齐。";
     elements.inputContentLabel.textContent = "Refresh Token";
-    elements.inputHint.textContent = "每行一个 · 支持标准 RT 与 Mobile RT";
+    elements.inputHint.textContent = "每行一个 · 自动去重 · 不联网验证";
     elements.input.placeholder = "每行粘贴一个 Refresh Token";
     return;
   }
@@ -558,7 +552,6 @@ function processManualTokenInput(): void {
   }
 
   const label = tokenType === "at" ? "AT" : "RT";
-  const variant = state.refreshTokenVariant;
   const operationId = ++inputOperationId;
   setInputStatus("正在本地解析 " + label + "…", "working");
   window.setTimeout(() => {
@@ -568,7 +561,6 @@ function processManualTokenInput(): void {
     const result = parseManualTokenText(text, tokenType, {
       maxTokens: MAX_FILES,
       now: new Date(),
-      refreshTokenVariant: variant,
       sourceName: "手动 " + label,
     });
     mergeParsedResult(result, true);
@@ -832,23 +824,6 @@ for (const button of elements.inputModeButtons) {
     nextButton.focus();
   });
 }
-
-elements.refreshTokenVariant.addEventListener("change", () => {
-  const variant = elements.refreshTokenVariant.value;
-  if (variant !== "standard" && variant !== "mobile") {
-    return;
-  }
-  state.refreshTokenVariant = variant;
-  inputOperationId += 1;
-  resetResults();
-  if (elements.input.value.trim()) {
-    processManualTokenInput();
-  } else {
-    setInputStatus(
-      "已切换为 " + (variant === "mobile" ? "Mobile RT" : "标准 RT") + "。",
-    );
-  }
-});
 
 elements.input.addEventListener("paste", () => {
   window.setTimeout(() => {

@@ -10,7 +10,6 @@ import type {
   OutputFormat,
   ParseCredentialResult,
   ParseIssue,
-  RefreshTokenVariant,
   Sub2ApiAccount,
   Sub2ApiDocument,
   Sub2ApiSettings,
@@ -18,7 +17,6 @@ import type {
 
 export const OPENAI_AUTH_CLAIM = "https://api.openai.com/auth";
 export const OPENAI_PROFILE_CLAIM = "https://api.openai.com/profile";
-export const OPENAI_MOBILE_RT_CLIENT_ID = "app_LlGpXReQgckcGGUo2JrYvtJK";
 
 interface CredentialCandidate {
   value: JsonRecord;
@@ -44,7 +42,6 @@ interface ParseOptions extends ConvertOptions {
 
 interface ManualTokenParseOptions extends ConvertOptions {
   maxTokens?: number;
-  refreshTokenVariant?: RefreshTokenVariant;
   sourceName?: string;
 }
 
@@ -1136,14 +1133,14 @@ function normalizeManualAccessToken(
   index: number,
   options: ManualTokenParseOptions,
 ): NormalizedAccount {
-  const isPersonalAccessToken = token.startsWith("at-");
+  if (!token.startsWith("at-") || token.length <= 3) {
+    throw new Error("AT 仅支持 at- 开头的 Personal Access Token");
+  }
   const sourceName = options.sourceName ?? "手动 AT";
   const account = normalizeSessionRecord({
     access_token: token,
     name: "OpenAI AT " + (index + 1),
-    auth_provider: isPersonalAccessToken
-      ? "codex_personal_access_token"
-      : "openai",
+    auth_provider: "codex_personal_access_token",
   }, {
     sourceName,
     sourcePath: "$[" + index + "]",
@@ -1151,23 +1148,21 @@ function normalizeManualAccessToken(
     now: options.now,
   });
 
-  if (isPersonalAccessToken) {
-    const settings = createManualSub2ApiSettings({
-      access_token: token,
-      auth_mode: "personal_access_token",
-      openai_auth_mode: "personal_access_token",
-      token_type: "Bearer",
-    }, {
-      import_source: "codex_personal_access_token",
-      auth_provider: "codex_personal_access_token",
-    }, {
-      concurrency: 3,
-      priority: 50,
-      autoPause: false,
-    });
-    settings.name = account.email ?? account.name;
-    account.sub2ApiSettings = settings;
-  }
+  const settings = createManualSub2ApiSettings({
+    access_token: token,
+    auth_mode: "personal_access_token",
+    openai_auth_mode: "personal_access_token",
+    token_type: "Bearer",
+  }, {
+    import_source: "codex_personal_access_token",
+    auth_provider: "codex_personal_access_token",
+  }, {
+    concurrency: 3,
+    priority: 50,
+    autoPause: false,
+  });
+  settings.name = account.email ?? account.name;
+  account.sub2ApiSettings = settings;
 
   return account;
 }
@@ -1177,18 +1172,10 @@ function normalizeManualRefreshToken(
   index: number,
   options: ManualTokenParseOptions,
 ): NormalizedAccount {
-  const variant = options.refreshTokenVariant ?? "standard";
-  const clientId = variant === "mobile"
-    ? OPENAI_MOBILE_RT_CLIENT_ID
-    : undefined;
-  const credentials = compactObject({
-    refresh_token: token,
-    client_id: clientId,
-  });
+  const credentials = { refresh_token: token };
   const settings = createManualSub2ApiSettings(credentials, {
     auth_provider: "openai",
     source: "manual_refresh_token",
-    refresh_token_variant: variant,
   }, {
     concurrency: 10,
     priority: 1,
@@ -1202,7 +1189,6 @@ function normalizeManualRefreshToken(
     sourceName,
     sourcePath: "$[" + index + "]",
     sourceType: "manual_rt",
-    preservedCpaFields: clientId ? { client_id: clientId } : undefined,
     sub2ApiSettings: settings,
     now: options.now,
   });

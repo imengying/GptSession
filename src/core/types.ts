@@ -6,7 +6,6 @@ export type AccountSourceType =
   | "manual_at"
   | "manual_rt";
 export type ManualTokenType = "at" | "rt";
-export type RefreshTokenVariant = "standard" | "mobile";
 export type JsonRecord = Record<string, unknown>;
 
 export interface Sub2ApiSettings {
