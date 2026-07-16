@@ -4,6 +4,7 @@
   "pages_build_output_dir": "./dist",
   "compatibility_date": "2026-07-16",
   "placement": {
-    "region": "aws:us-east-1"
+    "mode": "targeted",
+    "region": "aws:ap-southeast-1"
   }
 }

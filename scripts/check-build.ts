@@ -93,6 +93,7 @@ if (!headers.includes("connect-src 'self'")) {
 interface WranglerConfig {
   pages_build_output_dir?: unknown;
   placement?: {
+    mode?: unknown;
     region?: unknown;
   };
 }
@@ -104,8 +105,12 @@ if (wrangler.pages_build_output_dir !== "./dist") {
   console.error("wrangler.jsonc must target the Cloudflare Pages dist directory");
   process.exit(1);
 }
-if (wrangler.placement?.region !== "aws:us-east-1") {
-  console.error("Pages Functions must run in an OpenAI-supported placement region");
+if (
+  wrangler.placement?.mode !== "targeted"
+  || typeof wrangler.placement.region !== "string"
+  || !wrangler.placement.region.trim()
+) {
+  console.error("Pages Functions must use an explicit targeted placement region");
   process.exit(1);
 }
 
