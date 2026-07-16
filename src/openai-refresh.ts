@@ -1,16 +1,18 @@
 import {
   OPENAI_CODEX_CLIENT_ID,
   OPENAI_MOBILE_CLIENT_ID,
+  OPENAI_OAUTH_SCOPE,
+  OPENAI_OAUTH_TOKEN_URL,
   type OpenAiOAuthClientId,
   type OpenAiOAuthTokenInfo,
   type OpenAiPersonalAccessTokenInfo,
 } from "./core";
 
 interface RefreshErrorPayload {
-  error?: {
-    code?: unknown;
-    message?: unknown;
-  };
+  error?: unknown;
+  error_description?: unknown;
+  code?: unknown;
+  message?: unknown;
 }
 
 interface ParsedResponse<T> {
@@ -34,6 +36,27 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object"
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function readErrorDetails(payload: RefreshErrorPayload): {
+  code?: string;
+  message?: string;
+} {
+  const nested = recordValue(payload.error);
+  return {
+    code: stringValue(nested?.code)
+      ?? stringValue(payload.error)
+      ?? stringValue(payload.code),
+    message: stringValue(nested?.message)
+      ?? stringValue(payload.error_description)
+      ?? stringValue(payload.message),
+  };
+}
+
 async function parseResponse<T>(response: Response): Promise<ParsedResponse<T>> {
   const text = await response.text().catch(() => "");
   try {
@@ -44,7 +67,7 @@ async function parseResponse<T>(response: Response): Promise<ParsedResponse<T>> 
       };
     }
   } catch {
-    // A platform-level Cloudflare error can be plain text rather than JSON.
+    // Network edges can return a plain-text error instead of OAuth JSON.
   }
   return {
     payload: {},
@@ -69,39 +92,40 @@ async function requestRefreshToken(
   clientId: OpenAiOAuthClientId,
   signal?: AbortSignal,
 ): Promise<OpenAiOAuthTokenInfo> {
+  const form = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: clientId,
+    scope: OPENAI_OAUTH_SCOPE,
+  });
   let response: Response;
   try {
-    response = await fetch("/api/openai/refresh", {
+    response = await fetch(OPENAI_OAUTH_TOKEN_URL, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
       },
-      body: JSON.stringify({
-        refresh_token: refreshToken,
-        client_id: clientId,
-      }),
+      body: form,
       cache: "no-store",
-      credentials: "same-origin",
+      credentials: "omit",
+      redirect: "error",
+      referrerPolicy: "no-referrer",
       signal,
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
       throw error;
     }
-    throw new OpenAiRefreshError("无法连接 RT 联网验证接口，请稍后重试");
+    throw new OpenAiRefreshError(
+      "浏览器无法连接 OpenAI OAuth，请切换至 OpenAI 支持地区的网络节点后重试",
+    );
   }
 
   const { payload, plainText } = await parseResponse<OpenAiOAuthTokenInfo>(response);
   if (!response.ok) {
-    if (response.status === 404) {
-      throw new OpenAiRefreshError(
-        "RT 联网验证接口不可用，请通过 Cloudflare Pages Functions 运行项目",
-        response.status,
-        "PAGES_FUNCTION_NOT_FOUND",
-      );
-    }
-    const code = stringValue(payload.error?.code) ?? "OPENAI_OAUTH_REQUEST_FAILED";
-    const message = stringValue(payload.error?.message)
+    const details = readErrorDetails(payload);
+    const code = details.code ?? "OPENAI_OAUTH_REQUEST_FAILED";
+    const message = details.message
       ?? httpErrorMessage("RT", response, plainText);
     throw new OpenAiRefreshError(message, response.status, code);
   }
@@ -183,8 +207,9 @@ export async function validateOpenAiPersonalAccessToken(
         "PAGES_FUNCTION_NOT_FOUND",
       );
     }
-    const code = stringValue(payload.error?.code) ?? "OPENAI_CODEX_PAT_VALIDATE_FAILED";
-    const message = stringValue(payload.error?.message)
+    const details = readErrorDetails(payload);
+    const code = details.code ?? "OPENAI_CODEX_PAT_VALIDATE_FAILED";
+    const message = details.message
       ?? httpErrorMessage("AT", response, plainText);
     throw new OpenAiRefreshError(message, response.status, code);
   }

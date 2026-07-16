@@ -17,7 +17,6 @@ const requiredFiles = [
   "dist/_headers",
   "dist/theme.css",
   "dist/assets/favicon.svg",
-  "functions/api/openai/refresh.ts",
   "functions/api/openai/whoami.ts",
 ];
 const missing = requiredFiles.filter((relativePath) => (
@@ -65,10 +64,6 @@ if (violations.length) {
   process.exit(1);
 }
 
-if (!source.includes("/api/openai/refresh")) {
-  console.error("Browser bundle is missing the same-origin RT validation endpoint");
-  process.exit(1);
-}
 if (!source.includes("/api/openai/whoami")) {
   console.error("Browser bundle is missing the same-origin AT validation endpoint");
   process.exit(1);
@@ -78,14 +73,18 @@ const browserBundle = assetFiles
   .filter((file) => file.endsWith(".js"))
   .map((file) => readFileSync(join(root, "dist/assets", file), "utf8"))
   .join("\n");
-if (browserBundle.includes("https://auth.openai.com/oauth/token")) {
-  console.error("Browser bundle must not call the OpenAI OAuth endpoint directly");
+if (!browserBundle.includes("https://auth.openai.com/oauth/token")) {
+  console.error("Browser bundle is missing the direct OpenAI RT endpoint");
+  process.exit(1);
+}
+if (browserBundle.includes("/api/openai/refresh")) {
+  console.error("Browser bundle must not send RT through Cloudflare Pages");
   process.exit(1);
 }
 
 const headers = readFileSync(join(root, "dist/_headers"), "utf8");
-if (!headers.includes("connect-src 'self'")) {
-  console.error("dist/_headers must restrict network requests to connect-src 'self'");
+if (!headers.includes("connect-src 'self' https://auth.openai.com")) {
+  console.error("dist/_headers must only allow the fixed OpenAI auth origin");
   process.exit(1);
 }
 

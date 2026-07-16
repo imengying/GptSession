@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "ChatGPT credential converter with local transforms and OpenAI token validation on Cloudflare Pages.",
+  "description": "ChatGPT credential converter with browser-side RT refresh and AT validation on Cloudflare Pages.",
   "packageManager": "bun@1.3.14",
   "scripts": {
     "dev": "vite",

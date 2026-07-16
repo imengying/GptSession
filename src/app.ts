@@ -295,7 +295,7 @@ function renderInputControls(): void {
       "粘贴 Refresh Token，自动换取完整凭证后导出 Sub2API 或 CPA。";
     elements.inputGuideTitle.textContent = "手动输入 Refresh Token";
     elements.inputGuideDescription.textContent =
-      "输入后自动经本站 Cloudflare Function 连接 OpenAI；"
+      "输入后由当前浏览器直接连接 OpenAI；"
       + OPENAI_REGION_GUIDANCE + "。";
     elements.inputContentLabel.textContent = "Refresh Token";
     elements.inputHint.textContent = "每行一个 · 自动去重 · 自动匹配 OAuth 客户端";
