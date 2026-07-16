@@ -2,13 +2,16 @@ import { describe, expect, test } from "bun:test";
 
 import {
   OPENAI_AUTH_CLAIM,
+  OPENAI_CODEX_CLIENT_ID,
   OPENAI_PROFILE_CLAIM,
   buildZipArchive,
   buildCpaDocument,
   buildSub2ApiDocument,
   getDownloadDescriptor,
   getSub2ApiDocumentConflicts,
+  normalizeRefreshedOpenAiToken,
   normalizeSessionRecord,
+  normalizeValidatedOpenAiPersonalAccessToken,
   parseCredentialText,
   parseJwtPayload,
   parseManualTokenText,
@@ -340,7 +343,7 @@ describe("Manual AT and RT input", () => {
     });
   });
 
-  test("marks at- tokens as Sub2API personal access tokens", () => {
+  test("parses at- tokens locally before online validation", () => {
     const token = "at-personal-access-token";
     const parsed = parseManualTokenText(token + "\n" + token, "at", { now: NOW });
     const sub2api = toSub2ApiAccount(parsed.accounts[0], { now: NOW });
@@ -367,7 +370,56 @@ describe("Manual AT and RT input", () => {
     expect(cpa.refresh_token).toBe("");
   });
 
-  test("exports RT to both Sub2API and CPA", () => {
+  test("builds complete Sub2API and CPA credentials from a validated AT", () => {
+    const token = "at-validated-personal-access-token";
+    const account = normalizeValidatedOpenAiPersonalAccessToken(token, {
+      email: "pat@example.com",
+      chatgpt_user_id: "pat-user",
+      chatgpt_account_id: "pat-account",
+      chatgpt_plan_type: "pro",
+      chatgpt_account_is_fedramp: false,
+    }, 0, { now: NOW });
+    const sub2api = toSub2ApiAccount(account, { now: NOW });
+    const cpa = toCpaRecord(account, { now: NOW });
+
+    expect(account).toMatchObject({
+      sourceType: "manual_at",
+      email: "pat@example.com",
+      accountId: "pat-account",
+      userId: "pat-user",
+      planType: "pro",
+      accessToken: token,
+      refreshToken: undefined,
+      isRefreshable: false,
+    });
+    expect(sub2api).toMatchObject({
+      concurrency: 3,
+      priority: 50,
+      auto_pause_on_expired: false,
+      credentials: {
+        access_token: token,
+        auth_mode: "personal_access_token",
+        openai_auth_mode: "personal_access_token",
+        token_type: "Bearer",
+        email: "pat@example.com",
+        chatgpt_account_id: "pat-account",
+        chatgpt_user_id: "pat-user",
+        plan_type: "pro",
+        chatgpt_account_is_fedramp: false,
+      },
+    });
+    expect(cpa).toMatchObject({
+      type: "codex",
+      email: "pat@example.com",
+      account_id: "pat-account",
+      plan_type: "pro",
+      access_token: token,
+      refresh_token: "",
+      id_token_synthetic: true,
+    });
+  });
+
+  test("parses RT locally before online validation", () => {
     const parsed = parseManualTokenText("rt-refresh-token", "rt", {
       now: NOW,
     });
@@ -408,6 +460,71 @@ describe("Manual AT and RT input", () => {
     expect(restored.issues).toHaveLength(0);
     expect(restoredSub2Api.accounts[0].credentials).toEqual({
       refresh_token: "rt-refresh-token",
+    });
+  });
+
+  test("builds complete Sub2API and CPA credentials from a refreshed RT", () => {
+    const accessToken = jwt({
+      exp: EXPIRY,
+      email: "refreshed@example.com",
+      [OPENAI_AUTH_CLAIM]: {
+        chatgpt_account_id: "refreshed-account",
+        chatgpt_user_id: "refreshed-user",
+        chatgpt_plan_type: "pro",
+      },
+    });
+    const idToken = jwt({
+      email: "refreshed@example.com",
+      [OPENAI_AUTH_CLAIM]: {
+        chatgpt_account_id: "refreshed-account",
+        chatgpt_user_id: "refreshed-user",
+        chatgpt_plan_type: "pro",
+      },
+    });
+    const account = normalizeRefreshedOpenAiToken(
+      "original-refresh-token",
+      {
+        access_token: accessToken,
+        refresh_token: "rotated-refresh-token",
+        id_token: idToken,
+        expires_in: 3600,
+        client_id: OPENAI_CODEX_CLIENT_ID,
+      },
+      0,
+      { now: NOW },
+    );
+    const sub2Api = toSub2ApiAccount(account, { now: NOW });
+    const cpa = toCpaRecord(account, { now: NOW });
+
+    expect(account).toMatchObject({
+      sourceType: "manual_rt",
+      email: "refreshed@example.com",
+      accountId: "refreshed-account",
+      userId: "refreshed-user",
+      planType: "pro",
+      accessToken,
+      refreshToken: "rotated-refresh-token",
+      idToken,
+      idTokenSynthetic: false,
+      isRefreshable: true,
+    });
+    expect(sub2Api.credentials).toMatchObject({
+      access_token: accessToken,
+      refresh_token: "rotated-refresh-token",
+      id_token: idToken,
+      client_id: OPENAI_CODEX_CLIENT_ID,
+      expires_at: Math.floor(NOW.getTime() / 1000) + 3600,
+    });
+    expect(cpa).toMatchObject({
+      type: "codex",
+      email: "refreshed@example.com",
+      account_id: "refreshed-account",
+      plan_type: "pro",
+      access_token: accessToken,
+      refresh_token: "rotated-refresh-token",
+      id_token: idToken,
+      id_token_synthetic: false,
+      expired: new Date(NOW.getTime() + 3600_000).toISOString(),
     });
   });
 

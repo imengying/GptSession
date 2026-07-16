@@ -17,6 +17,8 @@ const requiredFiles = [
   "dist/_headers",
   "dist/theme.css",
   "dist/assets/favicon.svg",
+  "functions/api/openai/refresh.ts",
+  "functions/api/openai/whoami.ts",
 ];
 const missing = requiredFiles.filter((relativePath) => (
   !existsSync(join(root, relativePath))
@@ -48,7 +50,6 @@ const source = runtimeFiles.map((filePath) => (
   readFileSync(filePath, "utf8")
 )).join("\n");
 const forbiddenRuntimeApis = [
-  { label: "fetch", pattern: /\bfetch\s*\(/u },
   { label: "XMLHttpRequest", pattern: /\bXMLHttpRequest\b/u },
   { label: "sendBeacon", pattern: /\bsendBeacon\b/u },
   { label: "localStorage", pattern: /\blocalStorage\b/u },
@@ -60,14 +61,32 @@ const violations = forbiddenRuntimeApis
   .map((rule) => rule.label);
 
 if (violations.length) {
-  console.error("Browser-only security boundary violated by: " + violations.join(", "));
+  console.error("Client security boundary violated by: " + violations.join(", "));
+  process.exit(1);
+}
+
+if (!source.includes("/api/openai/refresh")) {
+  console.error("Browser bundle is missing the same-origin RT validation endpoint");
+  process.exit(1);
+}
+if (!source.includes("/api/openai/whoami")) {
+  console.error("Browser bundle is missing the same-origin AT validation endpoint");
+  process.exit(1);
+}
+
+const browserBundle = assetFiles
+  .filter((file) => file.endsWith(".js"))
+  .map((file) => readFileSync(join(root, "dist/assets", file), "utf8"))
+  .join("\n");
+if (browserBundle.includes("https://auth.openai.com/oauth/token")) {
+  console.error("Browser bundle must not call the OpenAI OAuth endpoint directly");
   process.exit(1);
 }
 
 const headers = readFileSync(join(root, "dist/_headers"), "utf8");
-if (!headers.includes("connect-src 'none'")) {
-  console.error("dist/_headers must keep connect-src 'none'");
+if (!headers.includes("connect-src 'self'")) {
+  console.error("dist/_headers must restrict network requests to connect-src 'self'");
   process.exit(1);
 }
 
-console.log("Cloudflare Pages build ready: dist/");
+console.log("Cloudflare Pages build ready: dist/ + functions/");

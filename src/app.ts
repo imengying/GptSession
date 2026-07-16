@@ -4,6 +4,8 @@ import {
   getAccountCredentialKeys,
   getDownloadDescriptor,
   getSub2ApiDocumentConflicts,
+  normalizeRefreshedOpenAiToken,
+  normalizeValidatedOpenAiPersonalAccessToken,
   parseCredentialText,
   parseManualTokenText,
   redactSensitiveDocument,
@@ -11,10 +13,17 @@ import {
   type DownloadDescriptor,
   type ManualTokenType,
   type NormalizedAccount,
+  type OpenAiOAuthTokenInfo,
+  type OpenAiPersonalAccessTokenInfo,
   type OutputDocument,
   type OutputFormat,
   type ParseIssue,
 } from "./core";
+import {
+  OpenAiRefreshError,
+  refreshOpenAiToken,
+  validateOpenAiPersonalAccessToken,
+} from "./openai-refresh";
 
 type InputMode = "json" | ManualTokenType;
 
@@ -87,8 +96,15 @@ const elements = {
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_TOTAL_IMPORT_SIZE = 50 * 1024 * 1024;
 const MAX_FILES = 500;
+const TOKEN_VALIDATION_CONCURRENCY = 3;
+const TOKEN_VALIDATION_DEBOUNCE_MS = 450;
 let inputOperationId = 0;
+let inputAbortController: AbortController | undefined;
+let tokenValidationInProgress = false;
+let tokenValidationTimer: number | undefined;
 let toastTimer: number | undefined;
+const refreshedTokenCache = new Map<string, OpenAiOAuthTokenInfo>();
+const validatedPatCache = new Map<string, OpenAiPersonalAccessTokenInfo>();
 
 const SOURCE_LABELS: Record<AccountSourceType, string> = {
   chatgpt_web_session: "SESSION",
@@ -168,6 +184,37 @@ function showToast(message: string, tone?: "error"): void {
   }, 2600);
 }
 
+function setTokenValidationInProgress(value: boolean): void {
+  tokenValidationInProgress = value;
+  elements.input.readOnly = value;
+  for (const button of elements.inputModeButtons) {
+    button.disabled = value;
+  }
+}
+
+function cancelInputOperation(): void {
+  window.clearTimeout(tokenValidationTimer);
+  tokenValidationTimer = undefined;
+  inputOperationId += 1;
+  inputAbortController?.abort();
+  inputAbortController = undefined;
+  setTokenValidationInProgress(false);
+}
+
+function startInputOperation(withAbortSignal = false): {
+  operationId: number;
+  signal?: AbortSignal;
+} {
+  cancelInputOperation();
+  if (withAbortSignal) {
+    inputAbortController = new AbortController();
+  }
+  return {
+    operationId: inputOperationId,
+    signal: inputAbortController?.signal,
+  };
+}
+
 function getWarningCount(): number {
   return state.issues.length + getFormatIssues().length + state.accounts.reduce(
     (total, account) => total + account.warnings.length,
@@ -221,7 +268,9 @@ function renderInputControls(): void {
     button.classList.toggle("is-active", active);
     button.setAttribute("aria-checked", String(active));
     button.tabIndex = active ? 0 : -1;
+    button.disabled = tokenValidationInProgress;
   }
+  elements.input.readOnly = tokenValidationInProgress;
 
   const tokenMode = state.inputMode !== "json";
   elements.inputToolbar.classList.toggle("is-token-mode", tokenMode);
@@ -230,24 +279,24 @@ function renderInputControls(): void {
 
   if (state.inputMode === "at") {
     elements.inputDescription.textContent =
-      "手动粘贴 at- 开头的 Access Token，支持批量生成 Sub2API 或 CPA 凭证。";
+      "粘贴 at- 开头的 Access Token，自动验证后导出 Sub2API 或 CPA。";
     elements.inputGuideTitle.textContent = "手动输入 Access Token";
     elements.inputGuideDescription.textContent =
-      "仅支持 at- token，并按 Codex Personal Access Token 导出。";
+      "输入后自动连接 OpenAI 获取账号信息；AT 本身不会被替换。";
     elements.inputContentLabel.textContent = "Access Token（at-）";
-    elements.inputHint.textContent = "每行一个 · 自动去重 · 不联网验证";
+    elements.inputHint.textContent = "每行一个 · 自动去重 · 联网验证账号信息";
     elements.input.placeholder = "at-...";
     return;
   }
 
   if (state.inputMode === "rt") {
     elements.inputDescription.textContent =
-      "手动粘贴 Refresh Token，支持批量生成 Sub2API 或 CPA 凭证。";
+      "粘贴 Refresh Token，自动换取完整凭证后导出 Sub2API 或 CPA。";
     elements.inputGuideTitle.textContent = "手动输入 Refresh Token";
     elements.inputGuideDescription.textContent =
-      "RT 不会在本地验证；导入目标端后需联网换取 Access Token 并补齐账号信息。";
+      "输入后自动经本站 Cloudflare Function 连接 OpenAI；不存储凭证。";
     elements.inputContentLabel.textContent = "Refresh Token";
-    elements.inputHint.textContent = "每行一个 · 自动去重 · 不联网验证";
+    elements.inputHint.textContent = "每行一个 · 自动去重 · 自动匹配 OAuth 客户端";
     elements.input.placeholder = "每行粘贴一个 Refresh Token";
     return;
   }
@@ -507,7 +556,7 @@ function processPastedInput(): void {
     return;
   }
   setInputStatus("正在本地解析粘贴内容…", "working");
-  const operationId = ++inputOperationId;
+  const { operationId } = startInputOperation();
   window.setTimeout(() => {
     if (operationId !== inputOperationId || state.inputMode !== "json") {
       return;
@@ -531,6 +580,199 @@ function processPastedInput(): void {
   }, 20);
 }
 
+function tokenLabel(tokenType: ManualTokenType): "AT" | "RT" {
+  return tokenType === "at" ? "AT" : "RT";
+}
+
+function prepareTokenInput(tokenType: ManualTokenType): number {
+  const text = elements.input.value;
+  const label = tokenLabel(tokenType);
+  if (!text.trim()) {
+    cancelInputOperation();
+    resetResults();
+    setInputStatus(
+      "请先粘贴 " + (tokenType === "at" ? "Access Token。" : "Refresh Token。"),
+      "error",
+    );
+    return 0;
+  }
+  if (new Blob([text]).size > MAX_TOTAL_IMPORT_SIZE) {
+    cancelInputOperation();
+    resetResults();
+    setInputStatus("粘贴内容超过 50 MB，请拆分后再导入。", "error");
+    return 0;
+  }
+
+  cancelInputOperation();
+  const parsed = parseManualTokenText(text, tokenType, {
+    maxTokens: MAX_FILES,
+    now: new Date(),
+    sourceName: "手动 " + label,
+  });
+  state.accounts = [];
+  state.issues = parsed.issues;
+  state.generatedAt = undefined;
+  state.revealSecrets = false;
+  renderAll();
+  if (parsed.accounts.length) {
+    setInputStatus(
+      "已读取 " + parsed.accounts.length + " 个 " + label
+        + "，正在准备联网验证…",
+    );
+  } else {
+    setInputStatus("未找到可验证的 " + label + "。", "error");
+  }
+  return parsed.accounts.length;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function onlineValidationErrorMessage(
+  error: unknown,
+  label: "AT" | "RT",
+): string {
+  if (error instanceof OpenAiRefreshError) {
+    return error.message + (error.code ? "（" + error.code + "）" : "");
+  }
+  return error instanceof Error ? error.message : label + " 联网验证失败";
+}
+
+async function validateOnlineTokenInput(
+  text: string,
+  tokenType: ManualTokenType,
+): Promise<void> {
+  const label = tokenLabel(tokenType);
+  const { operationId, signal } = startInputOperation(true);
+  setTokenValidationInProgress(true);
+  renderInputControls();
+  const parsed = parseManualTokenText(text, tokenType, {
+    maxTokens: MAX_FILES,
+    now: new Date(),
+    sourceName: "手动 " + label,
+  });
+  const resolved: Array<NormalizedAccount | undefined> = new Array(
+    parsed.accounts.length,
+  );
+  const networkIssues: ParseIssue[] = [];
+  let nextIndex = 0;
+  let completed = 0;
+
+  setInputStatus(
+    "正在连接 OpenAI 验证 " + label + "：0 / " + parsed.accounts.length + "…",
+    "working",
+  );
+
+  const worker = async (): Promise<void> => {
+    while (nextIndex < parsed.accounts.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (operationId !== inputOperationId || signal?.aborted) {
+        return;
+      }
+      const sourceAccount = parsed.accounts[index];
+      const token = tokenType === "at"
+        ? sourceAccount.accessToken
+        : sourceAccount.refreshToken;
+      if (!token) {
+        networkIssues.push({
+          sourceName: sourceAccount.sourceName,
+          sourcePath: sourceAccount.sourcePath,
+          reason: "未找到可验证的 " + label,
+        });
+        continue;
+      }
+
+      try {
+        if (tokenType === "at") {
+          let tokenInfo = validatedPatCache.get(token);
+          if (!tokenInfo) {
+            tokenInfo = await validateOpenAiPersonalAccessToken(token, signal);
+            validatedPatCache.set(token, tokenInfo);
+          }
+          resolved[index] = normalizeValidatedOpenAiPersonalAccessToken(
+            token,
+            tokenInfo,
+            index,
+            {
+              now: new Date(),
+              sourceName: sourceAccount.sourceName,
+              sourcePath: sourceAccount.sourcePath,
+            },
+          );
+        } else {
+          let tokenInfo = refreshedTokenCache.get(token);
+          if (!tokenInfo) {
+            tokenInfo = await refreshOpenAiToken(token, signal);
+            refreshedTokenCache.set(token, tokenInfo);
+            if (tokenInfo.refresh_token?.trim()) {
+              refreshedTokenCache.set(tokenInfo.refresh_token.trim(), tokenInfo);
+            }
+          }
+          resolved[index] = normalizeRefreshedOpenAiToken(
+            token,
+            tokenInfo,
+            index,
+            {
+              now: new Date(),
+              sourceName: sourceAccount.sourceName,
+              sourcePath: sourceAccount.sourcePath,
+            },
+          );
+        }
+      } catch (error) {
+        if (isAbortError(error)) {
+          return;
+        }
+        networkIssues.push({
+          sourceName: sourceAccount.sourceName,
+          sourcePath: sourceAccount.sourcePath,
+          reason: onlineValidationErrorMessage(error, label),
+        });
+      } finally {
+        completed += 1;
+        if (operationId === inputOperationId && !signal?.aborted) {
+          setInputStatus(
+            "正在连接 OpenAI 验证 " + label + "：" + completed + " / "
+              + parsed.accounts.length + "…",
+            "working",
+          );
+        }
+      }
+    }
+  };
+
+  const workerCount = Math.min(
+    TOKEN_VALIDATION_CONCURRENCY,
+    Math.max(1, parsed.accounts.length),
+  );
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  if (operationId !== inputOperationId || signal?.aborted) {
+    return;
+  }
+
+  inputAbortController = undefined;
+  setTokenValidationInProgress(false);
+  const accounts = resolved.filter(
+    (account): account is NormalizedAccount => Boolean(account),
+  );
+  mergeParsedResult({
+    accounts,
+    issues: [...parsed.issues, ...networkIssues],
+  }, true);
+  renderAll();
+  if (accounts.length) {
+    setInputStatus(
+      label + " 验证完成：成功 " + accounts.length + " 个，失败 "
+        + networkIssues.length + " 个。",
+      networkIssues.length ? "error" : "success",
+    );
+  } else {
+    setInputStatus(label + " 验证失败，请展开提示查看原因。", "error");
+  }
+}
+
 function processManualTokenInput(): void {
   const text = elements.input.value;
   const tokenType = state.inputMode;
@@ -551,30 +793,7 @@ function processManualTokenInput(): void {
     return;
   }
 
-  const label = tokenType === "at" ? "AT" : "RT";
-  const operationId = ++inputOperationId;
-  setInputStatus("正在本地解析 " + label + "…", "working");
-  window.setTimeout(() => {
-    if (operationId !== inputOperationId || state.inputMode !== tokenType) {
-      return;
-    }
-    const result = parseManualTokenText(text, tokenType, {
-      maxTokens: MAX_FILES,
-      now: new Date(),
-      sourceName: "手动 " + label,
-    });
-    mergeParsedResult(result, true);
-    renderAll();
-    if (state.accounts.length) {
-      setInputStatus(
-        label + " 解析完成：可导出 " + state.accounts.length
-          + " 个账号，发现 " + getWarningCount() + " 条提示。",
-        "success",
-      );
-    } else {
-      setInputStatus("未找到可导出的 " + label + "。", "error");
-    }
-  }, 20);
+  void validateOnlineTokenInput(text, tokenType);
 }
 
 function processCurrentInput(): void {
@@ -589,7 +808,7 @@ async function processFiles(fileList: FileList | File[]): Promise<void> {
   if (state.inputMode !== "json") {
     return;
   }
-  const operationId = ++inputOperationId;
+  const { operationId } = startInputOperation();
   const allFiles = Array.from(fileList);
   const jsonCandidates = allFiles.filter(
     (file) => file.name.toLowerCase().endsWith(".json"),
@@ -763,7 +982,9 @@ function setInputMode(mode: string | undefined): void {
   if (state.inputMode === mode) {
     return;
   }
-  inputOperationId += 1;
+  cancelInputOperation();
+  refreshedTokenCache.clear();
+  validatedPatCache.clear();
   state.inputMode = mode;
   elements.input.value = "";
   resetResults();
@@ -827,10 +1048,26 @@ for (const button of elements.inputModeButtons) {
 
 elements.input.addEventListener("paste", () => {
   window.setTimeout(() => {
-    if (elements.input.value.trim()) {
+    if (state.inputMode === "json" && elements.input.value.trim()) {
       processCurrentInput();
     }
   }, 0);
+});
+elements.input.addEventListener("input", () => {
+  if (state.inputMode === "json") {
+    return;
+  }
+  const inputMode = state.inputMode;
+  const count = prepareTokenInput(inputMode);
+  if (!count) {
+    return;
+  }
+  tokenValidationTimer = window.setTimeout(() => {
+    tokenValidationTimer = undefined;
+    if (state.inputMode === inputMode && elements.input.value.trim()) {
+      processManualTokenInput();
+    }
+  }, TOKEN_VALIDATION_DEBOUNCE_MS);
 });
 elements.input.addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
@@ -839,13 +1076,15 @@ elements.input.addEventListener("keydown", (event) => {
   }
 });
 elements.clearAll.addEventListener("click", () => {
-  inputOperationId += 1;
+  cancelInputOperation();
+  refreshedTokenCache.clear();
+  validatedPatCache.clear();
   elements.input.value = "";
   resetResults();
   setInputStatus("已清空输入和转换结果。");
 });
 elements.clearResults.addEventListener("click", () => {
-  inputOperationId += 1;
+  cancelInputOperation();
   resetResults();
   setInputStatus("已清除转换结果，输入内容仍保留。");
 });

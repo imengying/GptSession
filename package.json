@@ -3,12 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Browser-only ChatGPT Session, Sub2API and CPA credential converter.",
+  "description": "ChatGPT credential converter with local transforms and OpenAI token validation on Cloudflare Pages.",
   "packageManager": "bun@1.3.14",
   "scripts": {
     "dev": "vite",
     "build": "bun install --frozen-lockfile && bun run typecheck && bun test && vite build && bun run scripts/check-build.ts",
     "preview": "vite preview",
+    "dev:pages": "bun run build && wrangler pages dev dist",
     "typecheck": "tsc --noEmit",
     "deploy": "bun run build && bunx --bun wrangler pages deploy dist --project-name=session-bridge"
   },

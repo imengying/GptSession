@@ -14,6 +14,10 @@ import type {
   Sub2ApiDocument,
   Sub2ApiSettings,
 } from "./types";
+import type {
+  OpenAiOAuthTokenInfo,
+  OpenAiPersonalAccessTokenInfo,
+} from "./openai-oauth";
 
 export const OPENAI_AUTH_CLAIM = "https://api.openai.com/auth";
 export const OPENAI_PROFILE_CLAIM = "https://api.openai.com/profile";
@@ -1167,6 +1171,53 @@ function normalizeManualAccessToken(
   return account;
 }
 
+export function normalizeValidatedOpenAiPersonalAccessToken(
+  token: string,
+  tokenInfo: OpenAiPersonalAccessTokenInfo,
+  index: number,
+  options: ConvertOptions & { sourceName?: string; sourcePath?: string } = {},
+): NormalizedAccount {
+  if (!token.startsWith("at-") || token.length <= 3) {
+    throw new Error("AT 仅支持 at- 开头的 Personal Access Token");
+  }
+  const now = options.now ?? new Date();
+  const credentials = {
+    access_token: token,
+    auth_mode: "personal_access_token",
+    openai_auth_mode: "personal_access_token",
+    token_type: "Bearer",
+    email: tokenInfo.email,
+    chatgpt_account_id: tokenInfo.chatgpt_account_id,
+    chatgpt_user_id: tokenInfo.chatgpt_user_id,
+    plan_type: tokenInfo.chatgpt_plan_type,
+    chatgpt_account_is_fedramp: tokenInfo.chatgpt_account_is_fedramp,
+  };
+  const settings = createManualSub2ApiSettings(credentials, {
+    import_source: "codex_personal_access_token",
+    auth_provider: "codex_personal_access_token",
+    email: tokenInfo.email,
+  }, {
+    concurrency: 3,
+    priority: 50,
+    autoPause: false,
+  });
+  const sourceName = options.sourceName ?? "手动 AT";
+  const account = normalizeSessionRecord({
+    ...credentials,
+    name: tokenInfo.email,
+    auth_provider: "codex_personal_access_token",
+    last_refresh: now.toISOString(),
+  }, {
+    sourceName,
+    sourcePath: options.sourcePath ?? "$[" + index + "]",
+    sourceType: "manual_at",
+    sub2ApiSettings: settings,
+    now,
+  });
+  settings.name = account.email ?? account.name;
+  return account;
+}
+
 function normalizeManualRefreshToken(
   token: string,
   index: number,
@@ -1194,6 +1245,70 @@ function normalizeManualRefreshToken(
   });
   settings.name = account.name;
   account.warnings = [];
+  return account;
+}
+
+export function normalizeRefreshedOpenAiToken(
+  originalRefreshToken: string,
+  tokenInfo: OpenAiOAuthTokenInfo,
+  index: number,
+  options: ConvertOptions & { sourceName?: string; sourcePath?: string } = {},
+): NormalizedAccount {
+  const now = options.now ?? new Date();
+  const accessToken = firstNonEmpty(tokenInfo.access_token);
+  if (!accessToken) {
+    throw new Error("OpenAI 返回结果中缺少 access_token");
+  }
+  const refreshToken = firstNonEmpty(
+    tokenInfo.refresh_token,
+    originalRefreshToken,
+  ) ?? originalRefreshToken;
+  const expiresIn = toFiniteNumber(tokenInfo.expires_in);
+  const expiresAt = unixSecondsFromValue(tokenInfo.expires_at)
+    ?? (expiresIn !== undefined && expiresIn > 0
+      ? Math.floor(now.getTime() / 1000) + Math.floor(expiresIn)
+      : undefined);
+  const credentials = compactObject({
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    id_token: firstNonEmpty(tokenInfo.id_token),
+    expires_at: expiresAt,
+    client_id: tokenInfo.client_id,
+    email: firstNonEmpty(tokenInfo.email),
+    chatgpt_account_id: firstNonEmpty(tokenInfo.chatgpt_account_id),
+    chatgpt_user_id: firstNonEmpty(tokenInfo.chatgpt_user_id),
+    organization_id: firstNonEmpty(tokenInfo.organization_id),
+    plan_type: firstNonEmpty(tokenInfo.plan_type),
+    subscription_expires_at: firstNonEmpty(tokenInfo.subscription_expires_at),
+  });
+  const settings = createManualSub2ApiSettings(credentials, compactObject({
+    auth_provider: "openai",
+    source: "manual_refresh_token",
+    email: firstNonEmpty(tokenInfo.email),
+    name: firstNonEmpty(tokenInfo.name),
+    privacy_mode: firstNonEmpty(tokenInfo.privacy_mode),
+  }), {
+    concurrency: 10,
+    priority: 1,
+  });
+  const sourceName = options.sourceName ?? "手动 RT";
+  const account = normalizeSessionRecord({
+    ...credentials,
+    name: firstNonEmpty(
+      tokenInfo.name,
+      tokenInfo.email,
+      "OpenAI RT " + (index + 1),
+    ),
+    auth_provider: "openai",
+    last_refresh: now.toISOString(),
+  }, {
+    sourceName,
+    sourcePath: options.sourcePath ?? "$[" + index + "]",
+    sourceType: "manual_rt",
+    sub2ApiSettings: settings,
+    now,
+  });
+  settings.name = account.email ?? account.name;
   return account;
 }
 
