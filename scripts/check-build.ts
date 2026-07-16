@@ -1,0 +1,63 @@
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const requiredFiles = [
+  "dist/index.html",
+  "dist/_headers",
+  "dist/theme.css",
+  "dist/assets/favicon.svg",
+];
+const missing = requiredFiles.filter((relativePath) => (
+  !existsSync(join(root, relativePath))
+));
+
+if (missing.length) {
+  console.error("Cloudflare Pages build is missing required files:");
+  missing.forEach((file) => console.error(" - " + file));
+  process.exit(1);
+}
+
+const assetFiles = readdirSync(join(root, "dist/assets"));
+if (!assetFiles.some((file) => file.endsWith(".js"))) {
+  console.error("Vite build did not emit a JavaScript bundle");
+  process.exit(1);
+}
+if (!assetFiles.some((file) => file.endsWith(".css"))) {
+  console.error("Vite build did not emit a CSS bundle");
+  process.exit(1);
+}
+
+const source = [
+  "src/core/credentials.ts",
+  "src/core/redaction.ts",
+  "src/core/zip.ts",
+  "src/app.ts",
+].map((relativePath) => (
+  readFileSync(join(root, relativePath), "utf8")
+)).join("\n");
+const forbiddenRuntimeApis = [
+  { label: "fetch", pattern: /\bfetch\s*\(/u },
+  { label: "XMLHttpRequest", pattern: /\bXMLHttpRequest\b/u },
+  { label: "sendBeacon", pattern: /\bsendBeacon\b/u },
+  { label: "localStorage", pattern: /\blocalStorage\b/u },
+  { label: "sessionStorage", pattern: /\bsessionStorage\b/u },
+  { label: "IndexedDB", pattern: /\bindexedDB\b/u },
+];
+const violations = forbiddenRuntimeApis
+  .filter((rule) => rule.pattern.test(source))
+  .map((rule) => rule.label);
+
+if (violations.length) {
+  console.error("Browser-only security boundary violated by: " + violations.join(", "));
+  process.exit(1);
+}
+
+const headers = readFileSync(join(root, "dist/_headers"), "utf8");
+if (!headers.includes("connect-src 'none'")) {
+  console.error("dist/_headers must keep connect-src 'none'");
+  process.exit(1);
+}
+
+console.log("Cloudflare Pages build ready: dist/");

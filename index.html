@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="在浏览器本地转换 ChatGPT Web Session、sub2api 与 CPA 凭证文件。"
+    />
+    <meta name="theme-color" content="#0b111a" />
+    <meta name="color-scheme" content="dark" />
+    <title>Session Bridge</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/theme.css" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/app.ts"></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <span></span>
+            <span></span>
+          </span>
+          <span>
+            <strong>Session Bridge</strong>
+            <small>本地凭证转换工具</small>
+          </span>
+        </div>
+        <div class="topbar-meta">
+          <span class="live-dot"><i></i> 本地运行</span>
+          <span>不上传</span>
+          <span>不持久化</span>
+          <a
+            class="github-link"
+            href="https://github.com/imengying/GptSession"
+            target="_blank"
+            rel="noreferrer"
+            aria-label="前往 GitHub 仓库"
+            title="GitHub"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 .7a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2.24c-3.22.7-3.9-1.37-3.9-1.37-.52-1.34-1.28-1.7-1.28-1.7-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.57-.29-5.27-1.28-5.27-5.68 0-1.25.45-2.28 1.19-3.08-.12-.29-.52-1.46.11-3.04 0 0 .97-.31 3.16 1.18A10.93 10.93 0 0 1 12 6.13c.98 0 1.95.13 2.87.39 2.2-1.49 3.16-1.18 3.16-1.18.63 1.58.23 2.75.11 3.04.74.8 1.19 1.83 1.19 3.08 0 4.41-2.71 5.38-5.29 5.67.42.36.79 1.07.79 2.16v3.26c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z" />
+            </svg>
+          </a>
+        </div>
+      </header>
+
+      <section class="hero">
+        <div class="hero-copy">
+          <h1>三种输入，<span>格式自由互转。</span></h1>
+          <p class="hero-lead">
+            导入 ChatGPT Web Session、sub2api 或 CPA 凭证，转换、预览与打包均在当前浏览器内存中完成。
+          </p>
+          <div class="hero-pills" aria-label="当前能力">
+            <span>Session → sub2api</span>
+            <span>Session → CPA</span>
+            <span>CPA ↔ sub2api</span>
+            <span>批量 ZIP</span>
+          </div>
+        </div>
+
+      </section>
+
+      <main>
+        <section class="conversion-toolbar" aria-label="转换控制">
+          <div class="format-switch" role="tablist" aria-label="选择导出格式">
+            <button
+              class="format-option is-active"
+              type="button"
+              data-format="sub2api"
+              role="tab"
+              aria-selected="true"
+            >
+              <span>导出为</span>
+              <strong>sub2api</strong>
+            </button>
+            <button
+              class="format-option"
+              type="button"
+              data-format="cpa"
+              role="tab"
+              aria-selected="false"
+            >
+              <span>导出为</span>
+              <strong>CPA</strong>
+            </button>
+          </div>
+          <div class="toolbar-actions">
+            <button class="button button-secondary" id="copy-output" type="button" disabled>
+              复制完整 JSON
+            </button>
+            <button class="button button-accent" id="download-output" type="button" disabled>
+              下载 JSON
+            </button>
+          </div>
+        </section>
+
+        <section class="workspace-layout">
+          <section class="panel workspace-panel" aria-labelledby="input-title">
+            <div class="panel-head">
+              <div>
+                <p class="section-kicker">输入</p>
+                <h2 id="input-title">导入凭证</h2>
+                <p>粘贴 JSON，或导入一个文件、多个文件及整个目录。</p>
+              </div>
+            </div>
+
+            <div class="panel-content">
+              <div class="session-guide">
+                <div class="guide-icon" aria-hidden="true">i</div>
+                <div>
+                  <strong>自动识别 Session、CPA 与 sub2api</strong>
+                  <p>
+                    ChatGPT Session 可从
+                    <a href="https://chatgpt.com/api/auth/session" target="_blank" rel="noreferrer">
+                      chatgpt.com/api/auth/session
+                    </a>
+                    获取。
+                  </p>
+                </div>
+              </div>
+
+              <input
+                id="file-input"
+                type="file"
+                accept=".json,application/json"
+                multiple
+                hidden
+              />
+              <input
+                id="folder-input"
+                type="file"
+                accept=".json,application/json"
+                webkitdirectory
+                multiple
+                hidden
+              />
+
+              <div class="input-actions">
+                <button class="button button-primary" id="pick-files" type="button">
+                  导入文件
+                </button>
+                <button class="button button-primary" id="pick-folder" type="button">
+                  导入目录
+                </button>
+                <button class="button button-primary" id="clear-all" type="button">
+                  清空
+                </button>
+              </div>
+
+              <div class="field-label">
+                <label for="session-input">JSON 内容</label>
+                <span>粘贴后自动解析 · 支持连续 JSON 与拖入文件</span>
+              </div>
+              <div class="input-drop-shell" id="dropzone">
+                <textarea
+                  id="session-input"
+                  spellcheck="false"
+                  autocomplete="off"
+                  placeholder='{"type":"codex","email":"you@example.com","access_token":"..."}'
+                ></textarea>
+                <div class="drop-overlay" aria-hidden="true">
+                  <svg viewBox="0 0 32 32">
+                    <path d="M16 21V7m0 0-5 5m5-5 5 5M7 20v4a3 3 0 0 0 3 3h12a3 3 0 0 0 3-3v-4" />
+                  </svg>
+                  <strong>松开以导入 JSON 文件</strong>
+                </div>
+              </div>
+
+              <div class="status-bar" id="input-status" aria-live="polite">
+                <span class="status-light"></span>
+                等待导入 Session、CPA 或 sub2api JSON。
+              </div>
+            </div>
+          </section>
+
+          <section class="panel workspace-panel" aria-labelledby="output-title">
+            <div class="panel-head">
+              <div>
+                <p class="section-kicker">输出</p>
+                <h2 id="output-title">sub2api 导入包</h2>
+                <p id="format-description">
+                  将 Session 或 CPA 凭证转换为 sub2api 批量导入结构。
+                </p>
+              </div>
+              <span class="preview-badge" id="preview-badge">已脱敏预览</span>
+            </div>
+
+            <div class="panel-content">
+              <div class="stats-row">
+                <div class="stat">
+                  <strong id="stat-accounts">0</strong>
+                  <span>可导出账号</span>
+                </div>
+                <div class="stat">
+                  <strong id="stat-refreshable">0</strong>
+                  <span>可刷新凭证</span>
+                </div>
+                <div class="stat">
+                  <strong id="stat-issues">0</strong>
+                  <span>问题与跳过</span>
+                </div>
+              </div>
+
+              <div class="account-preview-heading">
+                <span>账号预览</span>
+                <button class="button button-ghost small" id="clear-results" type="button" disabled>
+                  清除结果
+                </button>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <colgroup>
+                    <col class="col-account" />
+                    <col class="col-plan" />
+                    <col class="col-expiry" />
+                    <col class="col-source" />
+                    <col class="col-action" />
+                  </colgroup>
+                  <thead>
+                    <tr>
+                      <th>账号</th>
+                      <th>套餐</th>
+                      <th>凭证状态</th>
+                      <th>来源</th>
+                      <th>导出</th>
+                    </tr>
+                  </thead>
+                  <tbody id="account-body">
+                    <tr class="empty-row">
+                      <td colspan="5">解析后的账号与来源格式会显示在这里。</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <details class="issues-box" id="issues-box">
+                <summary>
+                  <span>解析提示</span>
+                  <strong id="issues-summary">暂无问题</strong>
+                </summary>
+                <ul id="issues-list">
+                  <li class="issue-empty">未发现问题。</li>
+                </ul>
+              </details>
+
+              <div class="output-toolbar">
+                <span id="output-meta">等待账号</span>
+                <button
+                  class="reveal-button"
+                  id="toggle-secrets"
+                  type="button"
+                  aria-pressed="false"
+                  disabled
+                >
+                  显示完整凭证
+                </button>
+              </div>
+
+              <textarea
+                class="output-preview"
+                id="output-preview"
+                readonly
+                spellcheck="false"
+                placeholder="转换结果将在这里预览。"
+              ></textarea>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

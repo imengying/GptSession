@@ -1,0 +1,21 @@
+{
+  "name": "session-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser-only ChatGPT Session, sub2api and CPA credential converter.",
+  "packageManager": "bun@1.3.14",
+  "scripts": {
+    "dev": "vite",
+    "build": "bun run typecheck && vite build && bun run scripts/check-build.ts",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "deploy": "bun run build && bunx --bun wrangler pages deploy dist --project-name=session-bridge"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "typescript": "7.0.2",
+    "vite": "8.1.5",
+    "wrangler": "4.111.0"
+  }
+}

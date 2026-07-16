@@ -1,0 +1,81 @@
+# Dependencies and package-manager caches
+node_modules/
+.bun/
+.vite/
+*.tsbuildinfo
+
+# Build and test output
+dist/
+build/
+tests/
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+
+# Cloudflare Pages local state and secrets
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Environment files and local registry credentials
+.env
+.env.*
+!.env.example
+.npmrc
+
+# Local credential imports and generated exports
+# These files can contain login-equivalent tokens or passwords.
+*.session.json
+session*.json
+sessions*.json
+auth*.json
+oauth*.json
+token*.json
+tokens*.json
+credential*.json
+credentials*.json
+*.codex.json
+*@*.json
+cpa*.json
+CPA*.json
+sub2api*.json
+cpa-*.zip
+session-bridge-*.zip
+/[0-9]*.json
+/credentials/
+/sessions/
+/imports/
+/exports/
+/downloads/
+
+# Logs, temporary files and local caches
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.cache/
+.tmp/
+tmp/
+
+# Local editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.fleet/
+.history/
+
+# Local AI/tooling state
+.agents/
+.codex/
+.claude/
+
+# Lockfiles from package managers not used by this Bun project
+bun.lockb
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
