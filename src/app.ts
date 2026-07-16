@@ -187,8 +187,8 @@ function renderFormatControls(): void {
       ? "将 Session 或 sub2api 账号转换为独立 Codex CPA JSON；批量下载时自动打包为 ZIP。"
       : "生成 Codex CPA auth JSON，并保留可恢复的 token、账号信息与过期时间。";
     elements.downloadOutput.textContent = state.accounts.length > 1
-      ? "下载 CPA ZIP"
-      : "下载 CPA JSON";
+      ? "下载 ZIP"
+      : "下载 JSON";
   } else {
     elements.outputTitle.textContent = "sub2api 导入包";
     elements.formatDescription.textContent =
