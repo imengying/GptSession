@@ -94,7 +94,8 @@ bun run dev:pages
 
 - 推送到 `main` 分支会自动更新生产环境。
 - 其他分支和 Pull Request 可生成独立预览环境。
-- 不需要环境变量、数据库、Cloudflare 服务端密钥或额外运行时兼容标志。
+- 不需要环境变量、数据库或 Cloudflare 服务端密钥。
+- `wrangler.jsonc` 已为 Pages Functions 启用 `nodejs_compat`，无需在 Dashboard 重复配置。
 
 AT / RT 验证依赖当前 Cloudflare 边缘节点所在地区。若提示地区不受支持，
 请将访问本站的网络节点切换至日本、新加坡、美国等 OpenAI 支持地区后重试。

@@ -108,8 +108,11 @@ const wrangler = readFileSync(join(root, "wrangler.jsonc"), "utf8");
 if (
   !wrangler.includes('"pages_build_output_dir": "./dist"')
   || !wrangler.includes('"compatibility_date": "2026-07-17"')
+  || !wrangler.includes('"compatibility_flags": ["nodejs_compat"]')
 ) {
-  console.error("wrangler.jsonc must configure Pages output and compatibility date");
+  console.error(
+    "wrangler.jsonc must configure Pages output, compatibility date, and nodejs_compat",
+  );
   process.exit(1);
 }
 
