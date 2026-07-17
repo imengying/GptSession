@@ -17,7 +17,11 @@ const requiredFiles = [
   "dist/_headers",
   "dist/theme.css",
   "dist/assets/favicon.svg",
+  "functions/api/openai/refresh.ts",
   "functions/api/openai/whoami.ts",
+  "src/server/openai-proxy.ts",
+  "src/server/pages-api.ts",
+  "wrangler.jsonc",
 ];
 const missing = requiredFiles.filter((relativePath) => (
   !existsSync(join(root, relativePath))
@@ -64,27 +68,34 @@ if (violations.length) {
   process.exit(1);
 }
 
-if (!source.includes("/api/openai/whoami")) {
-  console.error("Browser bundle is missing the same-origin AT validation endpoint");
-  process.exit(1);
-}
-
 const browserBundle = assetFiles
   .filter((file) => file.endsWith(".js"))
   .map((file) => readFileSync(join(root, "dist/assets", file), "utf8"))
   .join("\n");
-if (!browserBundle.includes("https://auth.openai.com/oauth/token")) {
-  console.error("Browser bundle is missing the direct OpenAI RT endpoint");
+if (
+  !browserBundle.includes("/api/openai/whoami")
+  || !browserBundle.includes("/api/openai/refresh")
+) {
+  console.error("Browser bundle is missing a same-origin OpenAI validation endpoint");
   process.exit(1);
 }
-if (browserBundle.includes("/api/openai/refresh")) {
-  console.error("Browser bundle must not send RT through Cloudflare Pages");
+if (browserBundle.includes("https://auth.openai.com/oauth/token")) {
+  console.error("Browser bundle must not send RT directly to OpenAI");
   process.exit(1);
 }
 
 const headers = readFileSync(join(root, "dist/_headers"), "utf8");
-if (!headers.includes("connect-src 'self' https://auth.openai.com")) {
-  console.error("dist/_headers must only allow the fixed OpenAI auth origin");
+if (!headers.includes("connect-src 'self';")) {
+  console.error("dist/_headers must restrict browser connections to the same origin");
+  process.exit(1);
+}
+
+const wrangler = readFileSync(join(root, "wrangler.jsonc"), "utf8");
+if (
+  !wrangler.includes('"pages_build_output_dir": "./dist"')
+  || !wrangler.includes('"nodejs_compat"')
+) {
+  console.error("wrangler.jsonc must configure Pages output and nodejs_compat");
   process.exit(1);
 }
 

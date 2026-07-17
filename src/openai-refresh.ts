@@ -1,8 +1,6 @@
 import {
   OPENAI_CODEX_CLIENT_ID,
   OPENAI_MOBILE_CLIENT_ID,
-  OPENAI_OAUTH_SCOPE,
-  OPENAI_OAUTH_TOKEN_URL,
   type OpenAiOAuthClientId,
   type OpenAiOAuthTokenInfo,
   type OpenAiPersonalAccessTokenInfo,
@@ -92,22 +90,19 @@ async function requestRefreshToken(
   clientId: OpenAiOAuthClientId,
   signal?: AbortSignal,
 ): Promise<OpenAiOAuthTokenInfo> {
-  const form = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: refreshToken,
-    client_id: clientId,
-    scope: OPENAI_OAUTH_SCOPE,
-  });
   let response: Response;
   try {
-    response = await fetch(OPENAI_OAUTH_TOKEN_URL, {
+    response = await fetch("/api/openai/refresh", {
       method: "POST",
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
       },
-      body: form,
+      body: JSON.stringify({
+        refresh_token: refreshToken,
+        client_id: clientId,
+      }),
       cache: "no-store",
-      credentials: "omit",
+      credentials: "same-origin",
       redirect: "error",
       referrerPolicy: "no-referrer",
       signal,
@@ -117,12 +112,19 @@ async function requestRefreshToken(
       throw error;
     }
     throw new OpenAiRefreshError(
-      "浏览器无法连接 OpenAI OAuth，请切换至 OpenAI 支持地区的网络节点后重试",
+      "无法连接 RT 联网验证接口，请稍后重试",
     );
   }
 
   const { payload, plainText } = await parseResponse<OpenAiOAuthTokenInfo>(response);
   if (!response.ok) {
+    if (response.status === 404) {
+      throw new OpenAiRefreshError(
+        "RT 联网验证接口不可用，请通过 Cloudflare Pages Functions 运行项目",
+        response.status,
+        "PAGES_FUNCTION_NOT_FOUND",
+      );
+    }
     const details = readErrorDetails(payload);
     const code = details.code ?? "OPENAI_OAUTH_REQUEST_FAILED";
     const message = details.message

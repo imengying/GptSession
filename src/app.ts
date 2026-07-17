@@ -98,7 +98,6 @@ const MAX_TOTAL_IMPORT_SIZE = 50 * 1024 * 1024;
 const MAX_FILES = 500;
 const TOKEN_VALIDATION_CONCURRENCY = 3;
 const TOKEN_VALIDATION_DEBOUNCE_MS = 450;
-const OPENAI_REGION_GUIDANCE = "请切换至 OpenAI 支持地区的网络节点";
 let inputOperationId = 0;
 let inputAbortController: AbortController | undefined;
 let tokenValidationInProgress = false;
@@ -283,7 +282,7 @@ function renderInputControls(): void {
       "粘贴 at- 开头的 Access Token，自动验证后导出 Sub2API 或 CPA。";
     elements.inputGuideTitle.textContent = "手动输入 Access Token";
     elements.inputGuideDescription.textContent =
-      "输入后自动连接 OpenAI 获取账号信息；" + OPENAI_REGION_GUIDANCE + "。";
+      "输入后自动通过新加坡线路连接 OpenAI 获取账号信息。";
     elements.inputContentLabel.textContent = "Access Token（at-）";
     elements.inputHint.textContent = "每行一个 · 自动去重 · 联网验证账号信息";
     elements.input.placeholder = "at-...";
@@ -295,8 +294,7 @@ function renderInputControls(): void {
       "粘贴 Refresh Token，自动换取完整凭证后导出 Sub2API 或 CPA。";
     elements.inputGuideTitle.textContent = "手动输入 Refresh Token";
     elements.inputGuideDescription.textContent =
-      "输入后由当前浏览器直接连接 OpenAI；"
-      + OPENAI_REGION_GUIDANCE + "。";
+      "输入后自动通过新加坡线路连接 OpenAI 换取完整凭证。";
     elements.inputContentLabel.textContent = "Refresh Token";
     elements.inputHint.textContent = "每行一个 · 自动去重 · 自动匹配 OAuth 客户端";
     elements.input.placeholder = "每行粘贴一个 Refresh Token";
@@ -636,13 +634,7 @@ function onlineValidationErrorMessage(
   label: "AT" | "RT",
 ): string {
   if (error instanceof OpenAiRefreshError) {
-    let message = error.message;
-    const needsRegionGuidance = error.status === 502
-      || error.code === "unsupported_country_region_territory";
-    if (needsRegionGuidance && !message.includes("OpenAI 支持地区")) {
-      message += "；" + OPENAI_REGION_GUIDANCE + "后重试";
-    }
-    return message + (error.code ? "（" + error.code + "）" : "");
+    return error.message + (error.code ? "（" + error.code + "）" : "");
   }
   return error instanceof Error ? error.message : label + " 联网验证失败";
 }

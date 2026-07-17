@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { handleOpenAiRefresh } from "../functions/api/openai/refresh";
 import { handleOpenAiWhoami } from "../functions/api/openai/whoami";
 import {
   OPENAI_CODEX_CLIENT_ID,
@@ -14,7 +15,7 @@ import {
 
 describe("Cloudflare OpenAI AT function", () => {
   test("validates at- tokens through the fixed OpenAI whoami endpoint", async () => {
-    let forwardedUrl = "";
+    let forwardedPath = "";
     let authorization = "";
     let originator = "";
     const response = await handleOpenAiWhoami(new Request(
@@ -24,11 +25,10 @@ describe("Cloudflare OpenAI AT function", () => {
         headers: { "Origin": "https://session.example" },
         body: JSON.stringify({ access_token: "at-input-token" }),
       },
-    ), async (input, init) => {
-      forwardedUrl = String(input);
-      const headers = new Headers(init?.headers);
-      authorization = headers.get("Authorization") ?? "";
-      originator = headers.get("Originator") ?? "";
+    ), async (upstream) => {
+      forwardedPath = upstream.path;
+      authorization = upstream.headers?.Authorization ?? "";
+      originator = upstream.headers?.Originator ?? "";
       return Response.json({
         email: "pat@example.com",
         chatgpt_user_id: "pat-user",
@@ -41,7 +41,7 @@ describe("Cloudflare OpenAI AT function", () => {
     const payload = await response.json() as Record<string, unknown>;
 
     expect(response.status).toBe(200);
-    expect(forwardedUrl).toBe(OPENAI_PAT_WHOAMI_URL);
+    expect(forwardedPath).toBe(new URL(OPENAI_PAT_WHOAMI_URL).pathname);
     expect(authorization).toBe("Bearer at-input-token");
     expect(originator).toBe("codex_cli_rs");
     expect(payload).toMatchObject({
@@ -77,8 +77,96 @@ describe("Cloudflare OpenAI AT function", () => {
   });
 });
 
-describe("browser RT refresh client", () => {
-  test("refreshes directly in the browser and falls back to Mobile client_id", async () => {
+describe("Cloudflare OpenAI RT function", () => {
+  test("forwards only the fixed OAuth form and returns rotated credentials", async () => {
+    let forwardedMethod = "";
+    let forwardedPath = "";
+    let forwardedForm = new URLSearchParams();
+    const response = await handleOpenAiRefresh(new Request(
+      "https://session.example/api/openai/refresh",
+      {
+        method: "POST",
+        headers: { "Origin": "https://session.example" },
+        body: JSON.stringify({
+          refresh_token: "input-refresh-token",
+          client_id: OPENAI_CODEX_CLIENT_ID,
+        }),
+      },
+    ), async (upstream) => {
+      forwardedMethod = upstream.method;
+      forwardedPath = upstream.path;
+      forwardedForm = new URLSearchParams(upstream.body);
+      return Response.json({
+        access_token: "rotated-access-token",
+        refresh_token: "rotated-refresh-token",
+        expires_in: 3600,
+      });
+    });
+
+    expect(response.status).toBe(200);
+    expect(forwardedMethod).toBe("POST");
+    expect(forwardedPath).toBe(new URL(OPENAI_OAUTH_TOKEN_URL).pathname);
+    expect(forwardedForm.get("grant_type")).toBe("refresh_token");
+    expect(forwardedForm.get("refresh_token")).toBe("input-refresh-token");
+    expect(forwardedForm.get("client_id")).toBe(OPENAI_CODEX_CLIENT_ID);
+    expect(forwardedForm.get("scope")).toBe("openid profile email");
+    expect(await response.json()).toMatchObject({
+      access_token: "rotated-access-token",
+      refresh_token: "rotated-refresh-token",
+    });
+  });
+
+  test("rejects cross-origin credential submission", async () => {
+    const response = await handleOpenAiRefresh(new Request(
+      "https://session.example/api/openai/refresh",
+      {
+        method: "POST",
+        headers: { "Origin": "https://untrusted.example" },
+        body: JSON.stringify({
+          refresh_token: "input-refresh-token",
+          client_id: OPENAI_CODEX_CLIENT_ID,
+        }),
+      },
+    ));
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({
+      error: { code: "ORIGIN_NOT_ALLOWED" },
+    });
+  });
+
+  test("does not echo unexpected fields from OAuth errors", async () => {
+    const response = await handleOpenAiRefresh(new Request(
+      "https://session.example/api/openai/refresh",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          refresh_token: "input-refresh-token",
+          client_id: OPENAI_CODEX_CLIENT_ID,
+        }),
+      },
+    ), async () => Response.json({
+      error: {
+        code: "token_expired",
+        message: "Token expired",
+        debug_token: "must-not-leak",
+      },
+      refresh_token: "must-not-leak",
+    }, { status: 401 }));
+    const payload = await response.json() as Record<string, unknown>;
+
+    expect(response.status).toBe(401);
+    expect(payload).toEqual({
+      error: {
+        code: "token_expired",
+        message: "Token expired",
+      },
+    });
+  });
+});
+
+describe("browser OpenAI validation client", () => {
+  test("refreshes through Pages and falls back to Mobile client_id", async () => {
     const originalFetch = globalThis.fetch;
     const clientIds: string[] = [];
     const requestedUrls: string[] = [];
@@ -86,12 +174,10 @@ describe("browser RT refresh client", () => {
     globalThis.fetch = (async (input, init) => {
       requestedUrls.push(String(input));
       requestOptions.push(init ?? {});
-      const form = new URLSearchParams(String(init?.body));
-      const clientId = form.get("client_id") ?? "";
+      const body = JSON.parse(String(init?.body)) as Record<string, string>;
+      const clientId = body.client_id ?? "";
       clientIds.push(clientId);
-      expect(form.get("grant_type")).toBe("refresh_token");
-      expect(form.get("refresh_token")).toBe("input-refresh-token");
-      expect(form.get("scope")).toBe("openid profile email");
+      expect(body.refresh_token).toBe("input-refresh-token");
       if (clientId === OPENAI_CODEX_CLIENT_ID) {
         return Response.json({
           error: "invalid_grant",
@@ -112,13 +198,12 @@ describe("browser RT refresh client", () => {
         OPENAI_MOBILE_CLIENT_ID,
       ]);
       expect(requestedUrls).toEqual([
-        OPENAI_OAUTH_TOKEN_URL,
-        OPENAI_OAUTH_TOKEN_URL,
+        "/api/openai/refresh",
+        "/api/openai/refresh",
       ]);
       expect(requestOptions.every((init) => (
-        new Headers(init.headers).get("Content-Type")
-          === "application/x-www-form-urlencoded"
-        && init.credentials === "omit"
+        new Headers(init.headers).get("Content-Type") === "application/json"
+        && init.credentials === "same-origin"
         && init.redirect === "error"
         && init.referrerPolicy === "no-referrer"
       ))).toBe(true);
@@ -132,7 +217,7 @@ describe("browser RT refresh client", () => {
     }
   });
 
-  test("does not retry a rotating RT after a browser network or CORS failure", async () => {
+  test("does not retry a rotating RT after a Pages network failure", async () => {
     const originalFetch = globalThis.fetch;
     let requests = 0;
     globalThis.fetch = (async (_input, _init): Promise<Response> => {
@@ -142,7 +227,7 @@ describe("browser RT refresh client", () => {
 
     try {
       await expect(refreshOpenAiToken("input-refresh-token")).rejects.toMatchObject({
-        message: "浏览器无法连接 OpenAI OAuth，请切换至 OpenAI 支持地区的网络节点后重试",
+        message: "无法连接 RT 联网验证接口，请稍后重试",
         status: 0,
         code: "OPENAI_OAUTH_REQUEST_FAILED",
       });

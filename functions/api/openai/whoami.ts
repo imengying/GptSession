@@ -1,35 +1,29 @@
 import { OPENAI_PAT_WHOAMI_URL } from "../../../src/core/openai-oauth";
+import {
+  OpenAiProxyError,
+  requestOpenAiViaSingaporeProxy,
+  type OpenAiUpstreamRequester,
+} from "../../../src/server/openai-proxy";
+import {
+  assertSameOriginPost,
+  jsonResponse,
+  pagesApiErrorResponse,
+  readJsonObject,
+  readString,
+  type JsonRecord,
+} from "../../../src/server/pages-api";
 
-type Fetcher = (
-  input: RequestInfo | URL,
-  init?: RequestInit,
-) => Promise<Response>;
+interface PagesEnvironment {
+  OPENAI_PROXY_HOSTS?: string;
+}
 
 interface PagesContext {
+  env?: PagesEnvironment;
   request: Request;
 }
 
-interface JsonRecord {
-  [key: string]: unknown;
-}
-
-const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_ACCESS_TOKEN_LENGTH = 8 * 1024;
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return Response.json(body, {
-    status,
-    headers: {
-      "Cache-Control": "no-store, max-age=0",
-      "Referrer-Policy": "no-referrer",
-      "X-Content-Type-Options": "nosniff",
-    },
-  });
-}
-
-function readString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
+const WHOAMI_PATH = new URL(OPENAI_PAT_WHOAMI_URL).pathname;
 
 function safeUpstreamMessage(payload: unknown, status: number): string {
   if (payload && typeof payload === "object") {
@@ -44,44 +38,23 @@ function safeUpstreamMessage(payload: unknown, status: number): string {
   return "OpenAI AT 验证失败（HTTP " + status + "）";
 }
 
+function upstreamErrorCode(payload: JsonRecord): string | undefined {
+  const nested = payload.error && typeof payload.error === "object"
+    ? payload.error as JsonRecord
+    : undefined;
+  return readString(nested?.code) ?? readString(payload.code);
+}
+
 export async function handleOpenAiWhoami(
   request: Request,
-  fetcher: Fetcher = fetch,
+  requester: OpenAiUpstreamRequester = requestOpenAiViaSingaporeProxy,
 ): Promise<Response> {
-  if (request.method !== "POST") {
-    return jsonResponse({ error: { code: "METHOD_NOT_ALLOWED", message: "仅支持 POST" } }, 405);
-  }
-
-  const requestUrl = new URL(request.url);
-  const origin = request.headers.get("Origin");
-  if (origin && origin !== requestUrl.origin) {
-    return jsonResponse({ error: { code: "ORIGIN_NOT_ALLOWED", message: "请求来源不受信任" } }, 403);
-  }
-
-  const contentLength = Number(request.headers.get("Content-Length") ?? "0");
-  if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BYTES) {
-    return jsonResponse({ error: { code: "REQUEST_TOO_LARGE", message: "请求内容过大" } }, 413);
-  }
-
-  let rawBody: string;
-  try {
-    rawBody = await request.text();
-  } catch {
-    return jsonResponse({ error: { code: "INVALID_BODY", message: "无法读取请求内容" } }, 400);
-  }
-  if (new TextEncoder().encode(rawBody).byteLength > MAX_REQUEST_BYTES) {
-    return jsonResponse({ error: { code: "REQUEST_TOO_LARGE", message: "请求内容过大" } }, 413);
-  }
-
   let body: JsonRecord;
   try {
-    const parsed = JSON.parse(rawBody) as unknown;
-    if (!parsed || typeof parsed !== "object") {
-      throw new Error("not an object");
-    }
-    body = parsed as JsonRecord;
-  } catch {
-    return jsonResponse({ error: { code: "INVALID_JSON", message: "请求 JSON 无效" } }, 400);
+    assertSameOriginPost(request);
+    body = await readJsonObject(request);
+  } catch (error) {
+    return pagesApiErrorResponse(error);
   }
 
   const accessToken = readString(body.access_token);
@@ -101,21 +74,23 @@ export async function handleOpenAiWhoami(
 
   let upstream: Response;
   try {
-    upstream = await fetcher(OPENAI_PAT_WHOAMI_URL, {
+    upstream = await requester({
       method: "GET",
+      path: WHOAMI_PATH,
       headers: {
         "Accept": "application/json",
         "Authorization": "Bearer " + accessToken,
         "Originator": "codex_cli_rs",
         "User-Agent": "codex-cli/0.91.0",
       },
-      redirect: "error",
+      signal: request.signal,
     });
-  } catch {
+  } catch (error) {
+    const proxyError = error instanceof OpenAiProxyError ? error : undefined;
     return jsonResponse({
       error: {
-        code: "OPENAI_CODEX_PAT_NETWORK_ERROR",
-        message: "Cloudflare 无法连接 OpenAI AT 验证服务",
+        code: proxyError?.code ?? "OPENAI_CODEX_PAT_NETWORK_ERROR",
+        message: proxyError?.message ?? "无法通过新加坡线路连接 OpenAI AT 验证服务",
       },
     }, 502);
   }
@@ -134,13 +109,22 @@ export async function handleOpenAiWhoami(
   let payload: JsonRecord = {};
   try {
     const parsed = JSON.parse(text) as unknown;
-    if (parsed && typeof parsed === "object") {
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       payload = parsed as JsonRecord;
     }
   } catch {
     payload = {};
   }
 
+  const errorCode = upstreamErrorCode(payload);
+  if (errorCode === "unsupported_country_region_territory") {
+    return jsonResponse({
+      error: {
+        code: errorCode,
+        message: safeUpstreamMessage(payload, upstream.status),
+      },
+    }, 502);
+  }
   if (upstream.status === 401 || upstream.status === 403) {
     return jsonResponse({
       error: {
@@ -152,7 +136,7 @@ export async function handleOpenAiWhoami(
   if (!upstream.ok) {
     return jsonResponse({
       error: {
-        code: "OPENAI_CODEX_PAT_VALIDATE_FAILED",
+        code: errorCode ?? "OPENAI_CODEX_PAT_VALIDATE_FAILED",
         message: safeUpstreamMessage(payload, upstream.status),
       },
     }, 502);
@@ -181,5 +165,9 @@ export async function handleOpenAiWhoami(
 }
 
 export function onRequest(context: PagesContext): Promise<Response> {
-  return handleOpenAiWhoami(context.request);
+  return handleOpenAiWhoami(context.request, (upstreamRequest) => (
+    requestOpenAiViaSingaporeProxy(upstreamRequest, {
+      proxyHosts: context.env?.OPENAI_PROXY_HOSTS,
+    })
+  ));
 }
