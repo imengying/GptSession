@@ -4,10 +4,14 @@ import {
   OPENAI_OAUTH_TOKEN_URL,
 } from "../../../src/core/openai-oauth";
 import {
-  OpenAiProxyError,
-  requestOpenAiViaSingaporeProxy,
+  manualTokenValidationError,
+} from "../../../src/core/token-format";
+import {
+  OPENAI_UNSUPPORTED_REGION_MESSAGE,
+  OpenAiUpstreamError,
+  requestOpenAiUpstream,
   type OpenAiUpstreamRequester,
-} from "../../../src/server/openai-proxy";
+} from "../../../src/server/openai-upstream";
 import {
   assertSameOriginPost,
   jsonResponse,
@@ -17,16 +21,10 @@ import {
   type JsonRecord,
 } from "../../../src/server/pages-api";
 
-interface PagesEnvironment {
-  OPENAI_PROXY_HOSTS?: string;
-}
-
 interface PagesContext {
-  env?: PagesEnvironment;
   request: Request;
 }
 
-const MAX_REFRESH_TOKEN_LENGTH = 16 * 1024;
 const OAUTH_TOKEN_PATH = new URL(OPENAI_OAUTH_TOKEN_URL).pathname;
 
 function safeOAuthErrorPayload(payload: JsonRecord, status: number): JsonRecord {
@@ -41,24 +39,27 @@ function safeOAuthErrorPayload(payload: JsonRecord, status: number): JsonRecord 
     ?? readString(payload.error_description)
     ?? readString(payload.message)
     ?? "OpenAI OAuth 验证失败（HTTP " + status + "）";
+  const safeMessage = code === "unsupported_country_region_territory"
+    ? OPENAI_UNSUPPORTED_REGION_MESSAGE
+    : message;
   if (nested) {
     return {
       error: {
         code,
-        message,
+        message: safeMessage,
         type: readString(nested.type),
       },
     };
   }
   return {
     error: code,
-    error_description: message,
+    error_description: safeMessage,
   };
 }
 
 export async function handleOpenAiRefresh(
   request: Request,
-  requester: OpenAiUpstreamRequester = requestOpenAiViaSingaporeProxy,
+  requester: OpenAiUpstreamRequester = requestOpenAiUpstream,
 ): Promise<Response> {
   let body: JsonRecord;
   try {
@@ -70,11 +71,14 @@ export async function handleOpenAiRefresh(
 
   const refreshToken = readString(body.refresh_token);
   const clientId = readString(body.client_id);
-  if (!refreshToken || refreshToken.length > MAX_REFRESH_TOKEN_LENGTH) {
+  const refreshTokenError = refreshToken
+    ? manualTokenValidationError(refreshToken, "rt")
+    : "Refresh Token 无效";
+  if (!refreshToken || refreshTokenError) {
     return jsonResponse({
       error: {
         code: "OPENAI_OAUTH_REFRESH_TOKEN_INVALID",
-        message: "Refresh Token 无效",
+        message: refreshTokenError ?? "Refresh Token 无效",
       },
     }, 400);
   }
@@ -108,11 +112,11 @@ export async function handleOpenAiRefresh(
       signal: request.signal,
     });
   } catch (error) {
-    const proxyError = error instanceof OpenAiProxyError ? error : undefined;
+    const upstreamError = error instanceof OpenAiUpstreamError ? error : undefined;
     return jsonResponse({
       error: {
-        code: proxyError?.code ?? "OPENAI_OAUTH_REQUEST_FAILED",
-        message: proxyError?.message ?? "无法通过新加坡线路连接 OpenAI OAuth",
+        code: upstreamError?.code ?? "OPENAI_OAUTH_REQUEST_FAILED",
+        message: upstreamError?.message ?? "无法连接 OpenAI OAuth",
       },
     }, 502);
   }
@@ -140,9 +144,5 @@ export async function handleOpenAiRefresh(
 }
 
 export function onRequest(context: PagesContext): Promise<Response> {
-  return handleOpenAiRefresh(context.request, (upstreamRequest) => (
-    requestOpenAiViaSingaporeProxy(upstreamRequest, {
-      proxyHosts: context.env?.OPENAI_PROXY_HOSTS,
-    })
-  ));
+  return handleOpenAiRefresh(context.request, requestOpenAiUpstream);
 }

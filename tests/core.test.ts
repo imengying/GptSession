@@ -338,9 +338,9 @@ describe("Manual AT and RT input", () => {
 
     expect(parsed.accounts).toHaveLength(0);
     expect(parsed.issues).toHaveLength(3);
-    parsed.issues.forEach((issue) => {
-      expect(issue.reason).toContain("仅支持 at- 开头");
-    });
+    expect(parsed.issues[0].reason).toContain("仅支持 at- 开头");
+    expect(parsed.issues[1].reason).toContain("长度过短");
+    expect(parsed.issues[2].reason).toContain("仅支持 at- 开头");
   });
 
   test("parses at- tokens locally before online validation", () => {
@@ -463,6 +463,29 @@ describe("Manual AT and RT input", () => {
     });
   });
 
+  test("rejects pasted HTML and malformed token lines without networking", () => {
+    const html = "<!DOCTYPE html>\n<html><head><title>502: Bad gateway</title></head></html>";
+    const htmlResult = parseManualTokenText(html, "rt", { now: NOW });
+    const spacedResult = parseManualTokenText(
+      "rt-complete-token-value another-token-value",
+      "rt",
+      { now: NOW },
+    );
+    const jsonResult = parseManualTokenText(
+      '{"refresh_token":"rt-complete-token-value"}',
+      "rt",
+      { now: NOW },
+    );
+
+    expect(htmlResult.accounts).toHaveLength(0);
+    expect(htmlResult.issues).toHaveLength(1);
+    expect(htmlResult.issues[0].reason).toContain("HTML");
+    expect(spacedResult.accounts).toHaveLength(0);
+    expect(spacedResult.issues[0].reason).toContain("每行");
+    expect(jsonResult.accounts).toHaveLength(0);
+    expect(jsonResult.issues[0].reason).toContain("JSON 输入");
+  });
+
   test("builds complete Sub2API and CPA credentials from a refreshed RT", () => {
     const accessToken = jwt({
       exp: EXPIRY,
@@ -531,7 +554,7 @@ describe("Manual AT and RT input", () => {
   test("limits manual token batches to 500 entries", () => {
     const input = Array.from(
       { length: 501 },
-      (_, index) => "rt-batch-" + index,
+      (_, index) => "rt-batch-token-" + String(index).padStart(4, "0"),
     ).join("\n");
     const parsed = parseManualTokenText(input, "rt", {
       maxTokens: 500,

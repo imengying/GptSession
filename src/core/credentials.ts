@@ -18,6 +18,10 @@ import type {
   OpenAiOAuthTokenInfo,
   OpenAiPersonalAccessTokenInfo,
 } from "./openai-oauth";
+import {
+  detectNonTokenDocument,
+  manualTokenValidationError,
+} from "./token-format";
 
 export const OPENAI_AUTH_CLAIM = "https://api.openai.com/auth";
 export const OPENAI_PROFILE_CLAIM = "https://api.openai.com/profile";
@@ -1317,7 +1321,20 @@ export function parseManualTokenText(
   tokenType: ManualTokenType,
   options: ManualTokenParseOptions = {},
 ): ParseCredentialResult {
-  const rawTokens = String(text || "").split(/\s+/u).filter(Boolean);
+  const sourceName = options.sourceName ?? "手动凭证";
+  const documentError = detectNonTokenDocument(String(text || ""));
+  if (documentError) {
+    return {
+      accounts: [],
+      issues: [{ sourceName, reason: documentError }],
+    };
+  }
+
+  const rawTokens = String(text || "")
+    .replace(/\r\n?/gu, "\n")
+    .split("\n")
+    .map((token) => token.trim())
+    .filter(Boolean);
   const maxTokens = Math.max(1, options.maxTokens ?? 500);
   const accounts: NormalizedAccount[] = [];
   const issues: ParseIssue[] = [];
@@ -1325,16 +1342,25 @@ export function parseManualTokenText(
 
   if (rawTokens.length > maxTokens) {
     issues.push({
-      sourceName: options.sourceName ?? "手动凭证",
+      sourceName,
       reason: "一次最多处理 " + maxTokens + " 个 token，其余内容已跳过",
     });
   }
 
   rawTokens.slice(0, maxTokens).forEach((token, index) => {
+    const validationError = manualTokenValidationError(token, tokenType);
+    if (validationError) {
+      issues.push({
+        sourceName,
+        sourcePath: "$[" + index + "]",
+        reason: validationError,
+      });
+      return;
+    }
     const credentialKey = tokenType + ":" + token;
     if (seen.has(credentialKey)) {
       issues.push({
-        sourceName: options.sourceName ?? "手动凭证",
+        sourceName,
         sourcePath: "$[" + index + "]",
         reason: "检测到重复凭证，已忽略",
       });
@@ -1347,7 +1373,7 @@ export function parseManualTokenText(
         : normalizeManualRefreshToken(token, index, options));
     } catch (error) {
       issues.push({
-        sourceName: options.sourceName ?? "手动凭证",
+        sourceName,
         sourcePath: "$[" + index + "]",
         reason: error instanceof Error ? error.message : "无法解析 token",
       });

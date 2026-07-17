@@ -23,7 +23,7 @@ describe("Cloudflare OpenAI AT function", () => {
       {
         method: "POST",
         headers: { "Origin": "https://session.example" },
-        body: JSON.stringify({ access_token: "at-input-token" }),
+        body: JSON.stringify({ access_token: "at-input-token-value" }),
       },
     ), async (upstream) => {
       forwardedPath = upstream.path;
@@ -42,7 +42,7 @@ describe("Cloudflare OpenAI AT function", () => {
 
     expect(response.status).toBe(200);
     expect(forwardedPath).toBe(new URL(OPENAI_PAT_WHOAMI_URL).pathname);
-    expect(authorization).toBe("Bearer at-input-token");
+    expect(authorization).toBe("Bearer at-input-token-value");
     expect(originator).toBe("codex_cli_rs");
     expect(payload).toMatchObject({
       email: "pat@example.com",
@@ -63,7 +63,7 @@ describe("Cloudflare OpenAI AT function", () => {
       "https://session.example/api/openai/whoami",
       {
         method: "POST",
-        body: JSON.stringify({ access_token: "at-input-token" }),
+        body: JSON.stringify({ access_token: "at-input-token-value" }),
       },
     ), async () => upstream);
 
@@ -132,6 +132,55 @@ describe("Cloudflare OpenAI RT function", () => {
     expect(response.status).toBe(403);
     expect(await response.json()).toMatchObject({
       error: { code: "ORIGIN_NOT_ALLOWED" },
+    });
+  });
+
+  test("rejects malformed RT input before making an upstream request", async () => {
+    let requested = false;
+    const response = await handleOpenAiRefresh(new Request(
+      "https://session.example/api/openai/refresh",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          refresh_token: "<!DOCTYPE html><title>502 Bad gateway</title>",
+          client_id: OPENAI_CODEX_CLIENT_ID,
+        }),
+      },
+    ), async () => {
+      requested = true;
+      return Response.json({});
+    });
+
+    expect(response.status).toBe(400);
+    expect(requested).toBe(false);
+    expect(await response.json()).toMatchObject({
+      error: { code: "OPENAI_OAUTH_REFRESH_TOKEN_INVALID" },
+    });
+  });
+
+  test("returns a clear supported-region message", async () => {
+    const response = await handleOpenAiRefresh(new Request(
+      "https://session.example/api/openai/refresh",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          refresh_token: "input-refresh-token",
+          client_id: OPENAI_CODEX_CLIENT_ID,
+        }),
+      },
+    ), async () => Response.json({
+      error: {
+        code: "unsupported_country_region_territory",
+        message: "Country, region, or territory not supported",
+      },
+    }, { status: 403 }));
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "unsupported_country_region_territory",
+        message: "当前 Cloudflare 节点不受 OpenAI 支持，请切换至日本、新加坡或美国等支持地区的网络节点后重试",
+      },
     });
   });
 

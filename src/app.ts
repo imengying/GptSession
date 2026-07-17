@@ -95,6 +95,7 @@ const elements = {
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_TOTAL_IMPORT_SIZE = 50 * 1024 * 1024;
+const MAX_MANUAL_INPUT_SIZE = 8 * 1024 * 1024;
 const MAX_FILES = 500;
 const TOKEN_VALIDATION_CONCURRENCY = 3;
 const TOKEN_VALIDATION_DEBOUNCE_MS = 450;
@@ -282,7 +283,7 @@ function renderInputControls(): void {
       "粘贴 at- 开头的 Access Token，自动验证后导出 Sub2API 或 CPA。";
     elements.inputGuideTitle.textContent = "手动输入 Access Token";
     elements.inputGuideDescription.textContent =
-      "输入后自动通过新加坡线路连接 OpenAI 获取账号信息。";
+      "输入后自动通过当前 Cloudflare 节点连接 OpenAI 获取账号信息。";
     elements.inputContentLabel.textContent = "Access Token（at-）";
     elements.inputHint.textContent = "每行一个 · 自动去重 · 联网验证账号信息";
     elements.input.placeholder = "at-...";
@@ -294,7 +295,7 @@ function renderInputControls(): void {
       "粘贴 Refresh Token，自动换取完整凭证后导出 Sub2API 或 CPA。";
     elements.inputGuideTitle.textContent = "手动输入 Refresh Token";
     elements.inputGuideDescription.textContent =
-      "输入后自动通过新加坡线路连接 OpenAI 换取完整凭证。";
+      "输入后自动通过当前 Cloudflare 节点连接 OpenAI 换取完整凭证。";
     elements.inputContentLabel.textContent = "Refresh Token";
     elements.inputHint.textContent = "每行一个 · 自动去重 · 自动匹配 OAuth 客户端";
     elements.input.placeholder = "每行粘贴一个 Refresh Token";
@@ -596,10 +597,10 @@ function prepareTokenInput(tokenType: ManualTokenType): number {
     );
     return 0;
   }
-  if (new Blob([text]).size > MAX_TOTAL_IMPORT_SIZE) {
+  if (new Blob([text]).size > MAX_MANUAL_INPUT_SIZE) {
     cancelInputOperation();
     resetResults();
-    setInputStatus("粘贴内容超过 50 MB，请拆分后再导入。", "error");
+    setInputStatus("Token 输入超过 8 MB，请拆分后再验证。", "error");
     return 0;
   }
 
@@ -620,7 +621,10 @@ function prepareTokenInput(tokenType: ManualTokenType): number {
         + "，正在准备联网验证…",
     );
   } else {
-    setInputStatus("未找到可验证的 " + label + "。", "error");
+    setInputStatus(
+      parsed.issues[0]?.reason ?? "未找到可验证的 " + label + "。",
+      "error",
+    );
   }
   return parsed.accounts.length;
 }
@@ -637,6 +641,15 @@ function onlineValidationErrorMessage(
     return error.message + (error.code ? "（" + error.code + "）" : "");
   }
   return error instanceof Error ? error.message : label + " 联网验证失败";
+}
+
+function shouldStopTokenValidationBatch(error: unknown): boolean {
+  if (!(error instanceof OpenAiRefreshError)) {
+    return false;
+  }
+  return error.status === 0
+    || error.status >= 500
+    || error.code === "unsupported_country_region_territory";
 }
 
 async function validateOnlineTokenInput(
@@ -656,6 +669,7 @@ async function validateOnlineTokenInput(
     parsed.accounts.length,
   );
   const networkIssues: ParseIssue[] = [];
+  let batchStopReason: string | undefined;
   let nextIndex = 0;
   let completed = 0;
 
@@ -666,6 +680,9 @@ async function validateOnlineTokenInput(
 
   const worker = async (): Promise<void> => {
     while (nextIndex < parsed.accounts.length) {
+      if (batchStopReason) {
+        return;
+      }
       const index = nextIndex;
       nextIndex += 1;
       if (operationId !== inputOperationId || signal?.aborted) {
@@ -725,11 +742,16 @@ async function validateOnlineTokenInput(
         if (isAbortError(error)) {
           return;
         }
-        networkIssues.push({
-          sourceName: sourceAccount.sourceName,
-          sourcePath: sourceAccount.sourcePath,
-          reason: onlineValidationErrorMessage(error, label),
-        });
+        const reason = onlineValidationErrorMessage(error, label);
+        if (shouldStopTokenValidationBatch(error)) {
+          batchStopReason ??= reason;
+        } else {
+          networkIssues.push({
+            sourceName: sourceAccount.sourceName,
+            sourcePath: sourceAccount.sourcePath,
+            reason,
+          });
+        }
       } finally {
         completed += 1;
         if (operationId === inputOperationId && !signal?.aborted) {
@@ -747,13 +769,25 @@ async function validateOnlineTokenInput(
     TOKEN_VALIDATION_CONCURRENCY,
     Math.max(1, parsed.accounts.length),
   );
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  try {
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  } finally {
+    if (operationId === inputOperationId) {
+      inputAbortController = undefined;
+      setTokenValidationInProgress(false);
+      renderInputControls();
+    }
+  }
   if (operationId !== inputOperationId || signal?.aborted) {
     return;
   }
 
-  inputAbortController = undefined;
-  setTokenValidationInProgress(false);
+  if (batchStopReason) {
+    networkIssues.unshift({
+      sourceName: "手动 " + label,
+      reason: "批量验证已停止：" + batchStopReason,
+    });
+  }
   const accounts = resolved.filter(
     (account): account is NormalizedAccount => Boolean(account),
   );
@@ -774,26 +808,16 @@ async function validateOnlineTokenInput(
 }
 
 function processManualTokenInput(): void {
-  const text = elements.input.value;
   const tokenType = state.inputMode;
   if (tokenType !== "at" && tokenType !== "rt") {
     return;
   }
-  if (!text.trim()) {
-    setInputStatus(
-      "请先粘贴 " + (tokenType === "at" ? "Access Token。" : "Refresh Token。"),
-      "error",
-    );
-    showToast("没有可解析的输入", "error");
-    return;
-  }
-  if (new Blob([text]).size > MAX_TOTAL_IMPORT_SIZE) {
-    setInputStatus("粘贴内容超过 50 MB，请拆分后再导入。", "error");
-    showToast("粘贴内容过大", "error");
+  if (!prepareTokenInput(tokenType)) {
+    showToast(tokenLabel(tokenType) + " 输入格式无效", "error");
     return;
   }
 
-  void validateOnlineTokenInput(text, tokenType);
+  void validateOnlineTokenInput(elements.input.value, tokenType);
 }
 
 function processCurrentInput(): void {

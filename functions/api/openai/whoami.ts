@@ -1,9 +1,13 @@
 import { OPENAI_PAT_WHOAMI_URL } from "../../../src/core/openai-oauth";
 import {
-  OpenAiProxyError,
-  requestOpenAiViaSingaporeProxy,
+  manualTokenValidationError,
+} from "../../../src/core/token-format";
+import {
+  OPENAI_UNSUPPORTED_REGION_MESSAGE,
+  OpenAiUpstreamError,
+  requestOpenAiUpstream,
   type OpenAiUpstreamRequester,
-} from "../../../src/server/openai-proxy";
+} from "../../../src/server/openai-upstream";
 import {
   assertSameOriginPost,
   jsonResponse,
@@ -13,16 +17,10 @@ import {
   type JsonRecord,
 } from "../../../src/server/pages-api";
 
-interface PagesEnvironment {
-  OPENAI_PROXY_HOSTS?: string;
-}
-
 interface PagesContext {
-  env?: PagesEnvironment;
   request: Request;
 }
 
-const MAX_ACCESS_TOKEN_LENGTH = 8 * 1024;
 const WHOAMI_PATH = new URL(OPENAI_PAT_WHOAMI_URL).pathname;
 
 function safeUpstreamMessage(payload: unknown, status: number): string {
@@ -47,7 +45,7 @@ function upstreamErrorCode(payload: JsonRecord): string | undefined {
 
 export async function handleOpenAiWhoami(
   request: Request,
-  requester: OpenAiUpstreamRequester = requestOpenAiViaSingaporeProxy,
+  requester: OpenAiUpstreamRequester = requestOpenAiUpstream,
 ): Promise<Response> {
   let body: JsonRecord;
   try {
@@ -58,16 +56,14 @@ export async function handleOpenAiWhoami(
   }
 
   const accessToken = readString(body.access_token);
-  if (
-    !accessToken
-    || !accessToken.startsWith("at-")
-    || accessToken.length <= 3
-    || accessToken.length > MAX_ACCESS_TOKEN_LENGTH
-  ) {
+  const accessTokenError = accessToken
+    ? manualTokenValidationError(accessToken, "at")
+    : "Personal Access Token 必须以 at- 开头";
+  if (!accessToken || accessTokenError) {
     return jsonResponse({
       error: {
         code: "OPENAI_CODEX_PAT_INVALID_PREFIX",
-        message: "Personal Access Token 必须以 at- 开头",
+        message: accessTokenError ?? "Personal Access Token 无效",
       },
     }, 400);
   }
@@ -86,11 +82,11 @@ export async function handleOpenAiWhoami(
       signal: request.signal,
     });
   } catch (error) {
-    const proxyError = error instanceof OpenAiProxyError ? error : undefined;
+    const upstreamError = error instanceof OpenAiUpstreamError ? error : undefined;
     return jsonResponse({
       error: {
-        code: proxyError?.code ?? "OPENAI_CODEX_PAT_NETWORK_ERROR",
-        message: proxyError?.message ?? "无法通过新加坡线路连接 OpenAI AT 验证服务",
+        code: upstreamError?.code ?? "OPENAI_CODEX_PAT_NETWORK_ERROR",
+        message: upstreamError?.message ?? "无法连接 OpenAI AT 验证服务",
       },
     }, 502);
   }
@@ -121,9 +117,9 @@ export async function handleOpenAiWhoami(
     return jsonResponse({
       error: {
         code: errorCode,
-        message: safeUpstreamMessage(payload, upstream.status),
+        message: OPENAI_UNSUPPORTED_REGION_MESSAGE,
       },
-    }, 502);
+    }, 403);
   }
   if (upstream.status === 401 || upstream.status === 403) {
     return jsonResponse({
@@ -165,9 +161,5 @@ export async function handleOpenAiWhoami(
 }
 
 export function onRequest(context: PagesContext): Promise<Response> {
-  return handleOpenAiWhoami(context.request, (upstreamRequest) => (
-    requestOpenAiViaSingaporeProxy(upstreamRequest, {
-      proxyHosts: context.env?.OPENAI_PROXY_HOSTS,
-    })
-  ));
+  return handleOpenAiWhoami(context.request, requestOpenAiUpstream);
 }

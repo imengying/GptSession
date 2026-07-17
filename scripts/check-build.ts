@@ -19,9 +19,9 @@ const requiredFiles = [
   "dist/assets/favicon.svg",
   "functions/api/openai/refresh.ts",
   "functions/api/openai/whoami.ts",
-  "src/server/openai-proxy.ts",
+  "src/core/token-format.ts",
+  "src/server/openai-upstream.ts",
   "src/server/pages-api.ts",
-  "src/types/cloudflare-sockets.d.ts",
   "wrangler.jsonc",
 ];
 const missing = requiredFiles.filter((relativePath) => (
@@ -85,16 +85,16 @@ if (browserBundle.includes("https://auth.openai.com/oauth/token")) {
   process.exit(1);
 }
 
-const proxyTransport = readFileSync(
-  join(root, "src/server/openai-proxy.ts"),
+const upstreamTransport = readFileSync(
+  join(root, "src/server/openai-upstream.ts"),
   "utf8",
 );
-if (!proxyTransport.includes("cloudflare:sockets")) {
-  console.error("OpenAI proxy must use Cloudflare's native socket transport");
+if (!upstreamTransport.includes("ALLOWED_TARGETS")) {
+  console.error("OpenAI upstream must enforce a fixed target allowlist");
   process.exit(1);
 }
-if (/from ["']node:(?:net|tls)["']/u.test(proxyTransport)) {
-  console.error("OpenAI proxy must not use the Node network compatibility layer");
+if (source.includes("cloudflare:sockets") || /from ["']node:(?:net|tls)["']/u.test(source)) {
+  console.error("Runtime source must not use unsupported raw socket TLS overrides");
   process.exit(1);
 }
 
@@ -107,9 +107,9 @@ if (!headers.includes("connect-src 'self';")) {
 const wrangler = readFileSync(join(root, "wrangler.jsonc"), "utf8");
 if (
   !wrangler.includes('"pages_build_output_dir": "./dist"')
-  || !wrangler.includes('"nodejs_compat"')
+  || !wrangler.includes('"compatibility_date": "2026-07-17"')
 ) {
-  console.error("wrangler.jsonc must configure Pages output and nodejs_compat");
+  console.error("wrangler.jsonc must configure Pages output and compatibility date");
   process.exit(1);
 }
 

@@ -18,6 +18,8 @@ interface ParsedResponse<T> {
   plainText?: string;
 }
 
+const VALIDATION_REQUEST_TIMEOUT_MILLISECONDS = 20_000;
+
 export class OpenAiRefreshError extends Error {
   readonly code: string;
   readonly status: number;
@@ -85,36 +87,78 @@ function httpErrorMessage(
   return label + " 联网验证接口返回 HTTP " + response.status;
 }
 
+async function fetchValidationEndpoint(
+  input: string,
+  init: RequestInit,
+  signal: AbortSignal | undefined,
+  label: "RT" | "AT",
+): Promise<Response> {
+  if (signal?.aborted) {
+    throw new DOMException("The operation was aborted", "AbortError");
+  }
+
+  const controller = new AbortController();
+  let rejectGuard: ((error: Error) => void) | undefined;
+  const guard = new Promise<never>((_resolve, reject) => {
+    rejectGuard = reject;
+  });
+  const timeout = globalThis.setTimeout(() => {
+    rejectGuard?.(new OpenAiRefreshError(
+      label + " 联网验证超时，请稍后重试或更换网络节点",
+      0,
+      "OPENAI_VALIDATION_TIMEOUT",
+    ));
+    controller.abort();
+  }, VALIDATION_REQUEST_TIMEOUT_MILLISECONDS);
+  const onAbort = (): void => {
+    rejectGuard?.(new DOMException("The operation was aborted", "AbortError"));
+    controller.abort();
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    return await Promise.race([
+      fetch(input, {
+        ...init,
+        cache: "no-store",
+        credentials: "same-origin",
+        redirect: "error",
+        referrerPolicy: "no-referrer",
+        signal: controller.signal,
+      }),
+      guard,
+    ]);
+  } catch (error) {
+    if (error instanceof OpenAiRefreshError) {
+      throw error;
+    }
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw error;
+    }
+    throw new OpenAiRefreshError(
+      "无法连接 " + label + " 联网验证接口，请稍后重试",
+    );
+  } finally {
+    globalThis.clearTimeout(timeout);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 async function requestRefreshToken(
   refreshToken: string,
   clientId: OpenAiOAuthClientId,
   signal?: AbortSignal,
 ): Promise<OpenAiOAuthTokenInfo> {
-  let response: Response;
-  try {
-    response = await fetch("/api/openai/refresh", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        refresh_token: refreshToken,
-        client_id: clientId,
-      }),
-      cache: "no-store",
-      credentials: "same-origin",
-      redirect: "error",
-      referrerPolicy: "no-referrer",
-      signal,
-    });
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw error;
-    }
-    throw new OpenAiRefreshError(
-      "无法连接 RT 联网验证接口，请稍后重试",
-    );
-  }
+  const response = await fetchValidationEndpoint("/api/openai/refresh", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      refresh_token: refreshToken,
+      client_id: clientId,
+    }),
+  }, signal, "RT");
 
   const { payload, plainText } = await parseResponse<OpenAiOAuthTokenInfo>(response);
   if (!response.ok) {
@@ -181,24 +225,13 @@ export async function validateOpenAiPersonalAccessToken(
   accessToken: string,
   signal?: AbortSignal,
 ): Promise<OpenAiPersonalAccessTokenInfo> {
-  let response: Response;
-  try {
-    response = await fetch("/api/openai/whoami", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ access_token: accessToken }),
-      cache: "no-store",
-      credentials: "same-origin",
-      signal,
-    });
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw error;
-    }
-    throw new OpenAiRefreshError("无法连接 AT 联网验证接口，请稍后重试");
-  }
+  const response = await fetchValidationEndpoint("/api/openai/whoami", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ access_token: accessToken }),
+  }, signal, "AT");
 
   const { payload, plainText } = await parseResponse<OpenAiPersonalAccessTokenInfo>(response);
   if (!response.ok) {
