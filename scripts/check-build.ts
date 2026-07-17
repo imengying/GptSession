@@ -21,6 +21,7 @@ const requiredFiles = [
   "functions/api/openai/whoami.ts",
   "src/server/openai-proxy.ts",
   "src/server/pages-api.ts",
+  "src/types/cloudflare-sockets.d.ts",
   "wrangler.jsonc",
 ];
 const missing = requiredFiles.filter((relativePath) => (
@@ -81,6 +82,19 @@ if (
 }
 if (browserBundle.includes("https://auth.openai.com/oauth/token")) {
   console.error("Browser bundle must not send RT directly to OpenAI");
+  process.exit(1);
+}
+
+const proxyTransport = readFileSync(
+  join(root, "src/server/openai-proxy.ts"),
+  "utf8",
+);
+if (!proxyTransport.includes("cloudflare:sockets")) {
+  console.error("OpenAI proxy must use Cloudflare's native socket transport");
+  process.exit(1);
+}
+if (/from ["']node:(?:net|tls)["']/u.test(proxyTransport)) {
+  console.error("OpenAI proxy must not use the Node network compatibility layer");
   process.exit(1);
 }
 

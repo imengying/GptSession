@@ -6,7 +6,9 @@ import {
   OpenAiProxyError,
   parseOpenAiHttpResponse,
   parseOpenAiProxyHosts,
+  requestOpenAiViaSingaporeProxy,
   resolveOpenAiProxyCandidates,
+  type OpenAiSocketConnector,
 } from "../src/server/openai-proxy";
 
 describe("OpenAI Singapore proxy transport", () => {
@@ -99,5 +101,101 @@ describe("OpenAI Singapore proxy transport", () => {
     expect(() => parseOpenAiHttpResponse(new TextEncoder().encode(
       "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort",
     ))).toThrow("OpenAI 验证响应无效");
+  });
+
+  test("uses the Cloudflare socket transport with fixed OpenAI TLS identity", async () => {
+    const connections: unknown[] = [];
+    const tlsOptions: unknown[] = [];
+    const writes: string[] = [];
+    let secureSocketCloses = 0;
+    const responseBytes = new TextEncoder().encode(
+      "HTTP/1.1 401 Unauthorized\r\n"
+      + "Content-Type: application/json\r\n"
+      + "Content-Length: 15\r\n\r\n"
+      + "{\"error\":\"bad\"}",
+    );
+    const connector = ((address: unknown, options: unknown) => {
+      connections.push({ address, options });
+      const secureSocket = {
+        closed: Promise.resolve(),
+        opened: Promise.resolve({}),
+        readable: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(responseBytes);
+            controller.close();
+          },
+        }),
+        writable: new WritableStream<Uint8Array>({
+          write(chunk) {
+            writes.push(new TextDecoder().decode(chunk));
+          },
+        }),
+        async close() {
+          secureSocketCloses += 1;
+        },
+        startTls() {
+          throw new Error("already secured");
+        },
+      };
+      return {
+        closed: Promise.resolve(),
+        opened: Promise.resolve({}),
+        readable: new ReadableStream<Uint8Array>(),
+        writable: new WritableStream<Uint8Array>(),
+        async close() {},
+        startTls(options: unknown) {
+          tlsOptions.push(options);
+          return secureSocket;
+        },
+      };
+    }) as OpenAiSocketConnector;
+
+    const response = await requestOpenAiViaSingaporeProxy({
+      method: "GET",
+      path: "/api/accounts/v1/user-auth-credential/whoami",
+      headers: { "Authorization": "Bearer at-test" },
+    }, {
+      proxyHosts: "203.0.113.20:443",
+      socketConnector: connector,
+    });
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "bad" });
+    expect(connections).toEqual([{
+      address: { hostname: "203.0.113.20", port: 443 },
+      options: { allowHalfOpen: false, secureTransport: "starttls" },
+    }]);
+    expect(tlsOptions).toEqual([{ expectedServerHostname: "auth.openai.com" }]);
+    expect(writes[0]).toContain("Host: auth.openai.com\r\n");
+    expect(writes[0]).toContain("Authorization: Bearer at-test\r\n");
+    expect(secureSocketCloses).toBe(1);
+  });
+
+  test("times out and closes a stalled Cloudflare socket", async () => {
+    let closes = 0;
+    const stalledSocket = {
+      closed: new Promise<void>(() => undefined),
+      opened: new Promise<void>(() => undefined),
+      readable: new ReadableStream<Uint8Array>(),
+      writable: new WritableStream<Uint8Array>(),
+      async close() {
+        closes += 1;
+      },
+      startTls() {
+        return stalledSocket;
+      },
+    };
+    const connector = (() => stalledSocket) as OpenAiSocketConnector;
+
+    await expect(requestOpenAiViaSingaporeProxy({
+      method: "POST",
+      path: "/oauth/token",
+      body: "refresh_token=test",
+    }, {
+      connectTimeoutMilliseconds: 5,
+      proxyHosts: "203.0.113.21:443",
+      socketConnector: connector,
+    })).rejects.toMatchObject({ code: "OPENAI_PROXY_CONNECT_FAILED" });
+    expect(closes).toBeGreaterThan(0);
   });
 });

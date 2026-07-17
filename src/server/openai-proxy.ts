@@ -1,5 +1,7 @@
-import { connect as connectTcp, type Socket as TcpSocket } from "node:net";
-import { connect as connectTls, type TLSSocket } from "node:tls";
+import type {
+  connect as connectCloudflareSocket,
+  Socket as CloudflareSocket,
+} from "cloudflare:sockets";
 
 import {
   OPENAI_OAUTH_TOKEN_URL,
@@ -17,6 +19,9 @@ export interface OpenAiProxyRequest {
 export interface OpenAiProxyOptions {
   proxyHosts?: string;
   fetcher?: typeof fetch;
+  socketConnector?: OpenAiSocketConnector;
+  connectTimeoutMilliseconds?: number;
+  responseTimeoutMilliseconds?: number;
 }
 
 export interface OpenAiProxyCandidate {
@@ -27,6 +32,8 @@ export interface OpenAiProxyCandidate {
 export type OpenAiUpstreamRequester = (
   request: OpenAiProxyRequest,
 ) => Promise<Response>;
+
+export type OpenAiSocketConnector = typeof connectCloudflareSocket;
 
 export class OpenAiProxyError extends Error {
   readonly code: string;
@@ -46,8 +53,9 @@ const DNS_JSON_ENDPOINT = "https://cloudflare-dns.com/dns-query";
 const DNS_CACHE_MILLISECONDS = 5 * 60 * 1000;
 const DNS_TIMEOUT_MILLISECONDS = 3_000;
 const TLS_TIMEOUT_MILLISECONDS = 5_000;
-const RESPONSE_TIMEOUT_MILLISECONDS = 15_000;
-const MAX_PROXY_CANDIDATES = 12;
+const RESPONSE_TIMEOUT_MILLISECONDS = 10_000;
+const CONNECT_BATCH_SIZE = 3;
+const MAX_PROXY_CANDIDATES = 6;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_HEADER_BYTES = 32 * 1024;
 const OAUTH_TOKEN_PATH = new URL(OPENAI_OAUTH_TOKEN_URL).pathname;
@@ -73,7 +81,7 @@ interface CachedDnsResult {
 
 interface TlsAttempt {
   close: () => void;
-  promise: Promise<TLSSocket>;
+  promise: Promise<CloudflareSocket>;
 }
 
 const dnsCache = new Map<string, CachedDnsResult>();
@@ -209,15 +217,19 @@ export async function resolveOpenAiProxyCandidates(
     );
   }
 
+  const resolvedCandidates = await Promise.all(configured.map(async (candidate) => ({
+    candidate,
+    hosts: await resolveIpv4Hosts(candidate.host, fetcher),
+  })));
   const expanded = new Map<string, OpenAiProxyCandidate>();
-  for (const candidate of configured) {
-    const resolvedHosts = await resolveIpv4Hosts(candidate.host, fetcher);
+  for (const { candidate, hosts } of resolvedCandidates) {
+    const resolvedHosts = hosts.length ? hosts : [candidate.host];
     for (const host of resolvedHosts) {
       const resolved = { host, port: candidate.port };
       expanded.set(candidateKey(resolved), resolved);
-    }
-    if (!resolvedHosts.length || expanded.size < MAX_PROXY_CANDIDATES) {
-      expanded.set(candidateKey(candidate), candidate);
+      if (expanded.size >= MAX_PROXY_CANDIDATES) {
+        break;
+      }
     }
     if (expanded.size >= MAX_PROXY_CANDIDATES) {
       break;
@@ -226,55 +238,94 @@ export async function resolveOpenAiProxyCandidates(
   return shuffleCandidates([...expanded.values()].slice(0, MAX_PROXY_CANDIDATES));
 }
 
-function startTlsAttempt(candidate: OpenAiProxyCandidate): TlsAttempt {
-  let transport: TcpSocket | undefined;
-  let socket: TLSSocket | undefined;
+let defaultSocketConnectorPromise: Promise<OpenAiSocketConnector> | undefined;
+
+function loadDefaultSocketConnector(): Promise<OpenAiSocketConnector> {
+  defaultSocketConnectorPromise ??= import("cloudflare:sockets").then((module) => (
+    module.connect
+  ));
+  return defaultSocketConnectorPromise;
+}
+
+function closeSocket(socket: CloudflareSocket | undefined): void {
+  try {
+    if (socket) {
+      void socket.close().catch(() => undefined);
+    }
+  } catch {
+    // The socket may already have been invalidated by startTls().
+  }
+}
+
+function observeSocketClose(socket: CloudflareSocket): void {
+  void socket.closed.catch(() => undefined);
+}
+
+function startTlsAttempt(
+  candidate: OpenAiProxyCandidate,
+  connector: OpenAiSocketConnector,
+  timeoutMilliseconds: number,
+): TlsAttempt {
+  let transport: CloudflareSocket | undefined;
+  let socket: CloudflareSocket | undefined;
   let settled = false;
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  let rejectPromise: ((error: Error) => void) | undefined;
 
-  const close = (): void => {
+  const clearAttemptTimeout = (): void => {
     if (timeout) {
       clearTimeout(timeout);
+      timeout = undefined;
     }
-    socket?.destroy();
-    transport?.destroy();
   };
 
-  const promise = new Promise<TLSSocket>((resolve, reject) => {
-    const fail = (error: unknown): void => {
-      if (settled) {
-        return;
-      }
+  const close = (): void => {
+    clearAttemptTimeout();
+    closeSocket(socket);
+    closeSocket(transport);
+    if (!settled) {
       settled = true;
-      close();
-      reject(error instanceof Error ? error : new Error("TLS connection failed"));
-    };
+      rejectPromise?.(new Error("TLS connection cancelled"));
+    }
+  };
 
+  const fail = (error: unknown): void => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    clearAttemptTimeout();
+    closeSocket(socket);
+    closeSocket(transport);
+    rejectPromise?.(
+      error instanceof Error ? error : new Error("TLS connection failed"),
+    );
+  };
+
+  const promise = new Promise<CloudflareSocket>((resolve, reject) => {
+    rejectPromise = reject;
     try {
-      // Dial the relay as raw TCP, then let the official TLS stack apply OpenAI SNI
-      // and certificate verification over that existing connection.
-      transport = connectTcp({ host: candidate.host, port: candidate.port });
-      transport.setNoDelay(true);
-      socket = connectTls({
-        rejectUnauthorized: true,
-        servername: OPENAI_AUTH_HOST,
-        socket: transport,
+      transport = connector({
+        hostname: candidate.host,
+        port: candidate.port,
+      }, {
+        allowHalfOpen: false,
+        secureTransport: "starttls",
       });
-      timeout = setTimeout(() => fail(new Error("TLS connection timed out")), TLS_TIMEOUT_MILLISECONDS);
-      transport.on("error", fail);
-      socket.on("error", fail);
-      socket.once("end", () => fail(new Error("TLS connection ended before authorization")));
-      socket.once("secureConnect", () => {
-        if (!socket?.authorized) {
-          fail(new Error("TLS certificate authorization failed"));
+      observeSocketClose(transport);
+      socket = transport.startTls({ expectedServerHostname: OPENAI_AUTH_HOST });
+      observeSocketClose(socket);
+      timeout = setTimeout(() => {
+        fail(new Error("TLS connection timed out"));
+      }, timeoutMilliseconds);
+      socket.opened.then(() => {
+        if (settled || !socket) {
           return;
         }
         settled = true;
-        if (timeout) {
-          clearTimeout(timeout);
-        }
+        clearAttemptTimeout();
         resolve(socket);
-      });
+      }, fail);
     } catch (error) {
       fail(error);
     }
@@ -285,15 +336,28 @@ function startTlsAttempt(candidate: OpenAiProxyCandidate): TlsAttempt {
 
 async function openAuthorizedTlsSocket(
   candidates: OpenAiProxyCandidate[],
-): Promise<TLSSocket> {
-  for (const candidate of candidates) {
-    const attempt = startTlsAttempt(candidate);
+  connector: OpenAiSocketConnector,
+  timeoutMilliseconds: number,
+): Promise<CloudflareSocket> {
+  for (let offset = 0; offset < candidates.length; offset += CONNECT_BATCH_SIZE) {
+    const batch = candidates.slice(offset, offset + CONNECT_BATCH_SIZE);
+    const attempts = batch.map((candidate) => (
+      startTlsAttempt(candidate, connector, timeoutMilliseconds)
+    ));
     try {
-      const socket = await attempt.promise;
-      lastSuccessfulProxy = candidateKey(candidate);
-      return socket;
+      const winner = await Promise.any(attempts.map(async (attempt, index) => ({
+        index,
+        socket: await attempt.promise,
+      })));
+      attempts.forEach((attempt, index) => {
+        if (index !== winner.index) {
+          attempt.close();
+        }
+      });
+      lastSuccessfulProxy = candidateKey(batch[winner.index]!);
+      return winner.socket;
     } catch {
-      attempt.close();
+      attempts.forEach((attempt) => attempt.close());
     }
   }
   throw new OpenAiProxyError(
@@ -456,27 +520,29 @@ export function parseOpenAiHttpResponse(input: Uint8Array): Response {
 }
 
 async function exchangeHttpRequest(
-  socket: TLSSocket,
+  socket: CloudflareSocket,
   requestBytes: Uint8Array,
   signal?: AbortSignal,
+  timeoutMilliseconds = RESPONSE_TIMEOUT_MILLISECONDS,
 ): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let totalBytes = 0;
     let settled = false;
-    const timeout = setTimeout(() => fail(new Error("OpenAI response timed out")), RESPONSE_TIMEOUT_MILLISECONDS);
+    const timeout = setTimeout(() => {
+      closeSocket(socket);
+      fail(new Error("OpenAI response timed out"));
+    }, timeoutMilliseconds);
 
     const cleanup = (): void => {
       clearTimeout(timeout);
       signal?.removeEventListener("abort", onAbort);
     };
-    const finish = (): void => {
+    const finish = (response: Buffer): void => {
       if (settled) {
         return;
       }
       settled = true;
       cleanup();
-      resolve(Buffer.concat(chunks, totalBytes));
+      resolve(response);
     };
     function fail(error: unknown): void {
       if (settled) {
@@ -488,7 +554,7 @@ async function exchangeHttpRequest(
     }
     function onAbort(): void {
       fail(new DOMException("The operation was aborted", "AbortError"));
-      socket.destroy();
+      closeSocket(socket);
     }
 
     if (signal?.aborted) {
@@ -496,30 +562,35 @@ async function exchangeHttpRequest(
       return;
     }
     signal?.addEventListener("abort", onAbort, { once: true });
-    socket.on("data", (chunk: Buffer) => {
-      if (settled) {
-        return;
+
+    const exchange = async (): Promise<Buffer> => {
+      const writer = socket.writable.getWriter();
+      try {
+        await writer.write(requestBytes);
+      } finally {
+        writer.releaseLock();
       }
-      totalBytes += chunk.byteLength;
-      if (totalBytes > MAX_RESPONSE_BYTES + MAX_HEADER_BYTES) {
-        fail(new Error("OpenAI response is too large"));
-        socket.destroy();
-        return;
+
+      const reader = socket.readable.getReader();
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            return Buffer.concat(chunks, totalBytes);
+          }
+          totalBytes += value.byteLength;
+          if (totalBytes > MAX_RESPONSE_BYTES + MAX_HEADER_BYTES) {
+            throw new Error("OpenAI response is too large");
+          }
+          chunks.push(Buffer.from(value));
+        }
+      } finally {
+        reader.releaseLock();
       }
-      chunks.push(Buffer.from(chunk));
-    });
-    socket.once("end", finish);
-    socket.once("close", () => {
-      if (!settled) {
-        finish();
-      }
-    });
-    socket.once("error", fail);
-    socket.write(requestBytes, (error) => {
-      if (error) {
-        fail(error);
-      }
-    });
+    };
+    void exchange().then(finish, fail);
   });
 }
 
@@ -532,9 +603,19 @@ export async function requestOpenAiViaSingaporeProxy(
     options.proxyHosts ?? DEFAULT_PROXY_POOL,
     options.fetcher ?? fetch,
   );
-  const socket = await openAuthorizedTlsSocket(candidates);
+  const connector = options.socketConnector ?? await loadDefaultSocketConnector();
+  const socket = await openAuthorizedTlsSocket(
+    candidates,
+    connector,
+    options.connectTimeoutMilliseconds ?? TLS_TIMEOUT_MILLISECONDS,
+  );
   try {
-    const rawResponse = await exchangeHttpRequest(socket, requestBytes, request.signal);
+    const rawResponse = await exchangeHttpRequest(
+      socket,
+      requestBytes,
+      request.signal,
+      options.responseTimeoutMilliseconds ?? RESPONSE_TIMEOUT_MILLISECONDS,
+    );
     return parseOpenAiHttpResponse(rawResponse);
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
@@ -548,6 +629,6 @@ export async function requestOpenAiViaSingaporeProxy(
       "新加坡验证线路请求失败，请稍后重试",
     );
   } finally {
-    socket.destroy();
+    closeSocket(socket);
   }
 }
