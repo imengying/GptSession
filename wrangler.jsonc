@@ -1,7 +1,0 @@
-{
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "session-bridge",
-  "pages_build_output_dir": "./dist",
-  "compatibility_date": "2026-07-17",
-  "compatibility_flags": ["nodejs_compat"]
-}

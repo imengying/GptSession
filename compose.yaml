@@ -1,0 +1,19 @@
+name: session-bridge
+
+services:
+  app:
+    image: ghcr.io/imengying/gptsession:latest
+    build:
+      context: .
+      target: app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

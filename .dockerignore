@@ -1,0 +1,14 @@
+.git
+.github
+.agents
+.codex
+.claude
+.env
+.env.*
+target
+src/static/assets/session_bridge_web.js
+src/static/assets/session_bridge_web_bg.wasm
+*.log
+*.tmp
+*.swp
+*~

@@ -1,28 +1,18 @@
-# Dependencies and package-manager caches
-node_modules/
-.bun/
-.vite/
-*.tsbuildinfo
+# Rust build output
+/target/
 
-# Build and test output
-dist/
-build/
-coverage/
-.nyc_output/
-playwright-report/
-test-results/
-
-# Cloudflare Pages local state and secrets
-.wrangler/
-.dev.vars
-.dev.vars.*
-!.dev.vars.example
+# Generated WebAssembly bindings
+/src/static/assets/session_bridge_web.js
+/src/static/assets/session_bridge_web_bg.wasm
 
 # Environment files and local registry credentials
 .env
 .env.*
-!.env.example
 .npmrc
+
+# TLS certificates
+*.pem
+*.key
 
 # Local credential imports and generated exports
 # These files can contain login-equivalent tokens or passwords.
@@ -72,9 +62,3 @@ Thumbs.db
 .agents/
 .codex/
 .claude/
-
-# Lockfiles from package managers not used by this Bun project
-bun.lockb
-package-lock.json
-pnpm-lock.yaml
-yarn.lock

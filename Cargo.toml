@@ -1,0 +1,81 @@
+[package]
+name = "session-bridge"
+description = "Unified web and OpenAI validation server for Session Bridge"
+edition = "2024"
+license = "MIT"
+publish = false
+rust-version = "1.85"
+version = "0.2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde_json = "1.0.150"
+
+[target.'cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))'.dependencies]
+async-trait = "0.1.89"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+mime_guess = "2.0.5"
+reqwest = { version = "0.13.4", default-features = false, features = ["form", "http2", "rustls"] }
+rust-embed = "8.12.0"
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.53.0", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tower = { version = "0.5.3", features = ["limit"] }
+
+[target.'cfg(target_arch = "wasm64")'.dependencies]
+base64 = "0.22.1"
+futures-util = "0.3.32"
+js-sys = "0.3.103"
+wasm-bindgen = "0.2.126"
+wasm-bindgen-futures = "0.4.76"
+
+[target.'cfg(target_arch = "wasm64")'.dependencies.web-sys]
+version = "0.3.103"
+features = [
+  "AbortController",
+  "AbortSignal",
+  "Blob",
+  "BlobPropertyBag",
+  "Clipboard",
+  "DataTransfer",
+  "Document",
+  "DomTokenList",
+  "DragEvent",
+  "Element",
+  "Event",
+  "EventTarget",
+  "File",
+  "FileList",
+  "Headers",
+  "HtmlAnchorElement",
+  "HtmlButtonElement",
+  "HtmlDetailsElement",
+  "HtmlElement",
+  "HtmlInputElement",
+  "HtmlTableSectionElement",
+  "HtmlTextAreaElement",
+  "KeyboardEvent",
+  "Navigator",
+  "Node",
+  "RequestCache",
+  "RequestCredentials",
+  "RequestInit",
+  "RequestRedirect",
+  "Response",
+  "Url",
+  "Window",
+]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+panic = "abort"
+strip = "symbols"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
