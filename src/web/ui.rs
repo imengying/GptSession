@@ -75,6 +75,39 @@ fn set_class(element: &Element, class_name: &str, enabled: bool) {
     let _ = element.class_list().toggle_with_force(class_name, enabled);
 }
 
+fn is_light_theme() -> Result<bool, JsValue> {
+    Ok(document()?
+        .document_element()
+        .is_some_and(|root| root.get_attribute("data-theme").as_deref() == Some("light")))
+}
+
+fn set_theme(light: bool) -> Result<(), JsValue> {
+    let document = document()?;
+    let root = document
+        .document_element()
+        .ok_or_else(|| JsValue::from_str("html 元素不可用"))?;
+    if light {
+        root.set_attribute("data-theme", "light")?;
+    } else {
+        root.remove_attribute("data-theme")?;
+    }
+
+    let action = if light {
+        "切换深色主题"
+    } else {
+        "切换浅色主题"
+    };
+    let button: HtmlButtonElement = by_id("theme-toggle")?;
+    button.set_attribute("aria-label", action)?;
+    button.set_attribute("title", action)?;
+    button.set_attribute("aria-pressed", if light { "true" } else { "false" })?;
+
+    if let Some(meta) = document.query_selector("meta[name='theme-color']")? {
+        meta.set_attribute("content", if light { "#f4f4f5" } else { "#09090b" })?;
+    }
+    Ok(())
+}
+
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -698,7 +731,7 @@ fn start_manual_validation(shared: SharedApp) -> Result<(), JsValue> {
     };
     set_input_status(
         &format!(
-            "正在连接 OpenAI 验证 {label}：0 / {}…",
+            "正在连接 OpenAI 验证 {label}：准备验证 {} 个…",
             parsed.accounts.len()
         ),
         Some("working"),
@@ -715,6 +748,15 @@ fn start_manual_validation(shared: SharedApp) -> Result<(), JsValue> {
                 return;
             }
             let chunk_end = (chunk_start + TOKEN_VALIDATION_CONCURRENCY).min(total);
+            let current = if chunk_end == chunk_start + 1 {
+                chunk_end.to_string()
+            } else {
+                format!("{} - {}", chunk_start + 1, chunk_end)
+            };
+            let _ = set_input_status(
+                &format!("正在连接 OpenAI 验证 {label}：正在处理 {current} / {total}…"),
+                Some("working"),
+            );
             let jobs = parsed.accounts[chunk_start..chunk_end]
                 .iter()
                 .cloned()
@@ -1247,6 +1289,13 @@ fn bind_file_controls(shared: &SharedApp) -> Result<(), JsValue> {
 }
 
 fn bind_actions(shared: &SharedApp) -> Result<(), JsValue> {
+    let theme_toggle: HtmlButtonElement = by_id("theme-toggle")?;
+    listen_event(&theme_toggle, "click", move |_| {
+        if let Ok(light) = is_light_theme() {
+            let _ = set_theme(!light);
+        }
+    })?;
+
     let clear_all: HtmlButtonElement = by_id("clear-all")?;
     let clear_shared = Rc::clone(shared);
     listen_event(&clear_all, "click", move |_| {
@@ -1315,6 +1364,7 @@ fn bind_actions(shared: &SharedApp) -> Result<(), JsValue> {
 
 pub fn start() -> Result<(), JsValue> {
     let shared = Rc::new(RefCell::new(App::default()));
+    set_theme(is_light_theme()?)?;
     bind_segmented_controls(&shared)?;
     bind_input(&shared)?;
     bind_file_controls(&shared)?;

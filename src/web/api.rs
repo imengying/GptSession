@@ -13,7 +13,7 @@ use super::{
     model::{JsonMap, OAuthTokenInfo, PersonalAccessTokenInfo},
 };
 
-const REQUEST_TIMEOUT_MS: i32 = 20_000;
+const REQUEST_TIMEOUT_MS: i32 = 15_000;
 
 #[derive(Debug)]
 struct ApiError {
@@ -225,13 +225,18 @@ async fn request_refresh_token(
 }
 
 pub async fn refresh_token(refresh_token: &str) -> Result<OAuthTokenInfo, String> {
-    match request_refresh_token(refresh_token, OPENAI_CODEX_CLIENT_ID).await {
+    let (primary_client_id, fallback_client_id) = if refresh_token.starts_with("rt.1.") {
+        (OPENAI_MOBILE_CLIENT_ID, OPENAI_CODEX_CLIENT_ID)
+    } else {
+        (OPENAI_CODEX_CLIENT_ID, OPENAI_MOBILE_CLIENT_ID)
+    };
+    match request_refresh_token(refresh_token, primary_client_id).await {
         Ok(info) => Ok(info),
         Err(error)
             if matches!(error.status, 400 | 401)
                 && !error.code.to_ascii_lowercase().contains("reused") =>
         {
-            request_refresh_token(refresh_token, OPENAI_MOBILE_CLIENT_ID)
+            request_refresh_token(refresh_token, fallback_client_id)
                 .await
                 .map_err(|error| format!("{}（{}）", error.message, error.code))
         }

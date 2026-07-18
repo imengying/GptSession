@@ -7,8 +7,8 @@
       name="description"
       content="转换 ChatGPT Web Session、Sub2API 与 CPA 凭证，并支持 AT / RT 联网验证。"
     />
-    <meta name="theme-color" content="#0b111a" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#09090b" />
+    <meta name="color-scheme" content="dark light" />
     <title>Session Bridge</title>
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/theme.css" />
@@ -32,6 +32,22 @@
           <span class="live-dot"><i></i> 本地转换</span>
           <span>AT / RT 联网验证</span>
           <span>不持久化</span>
+          <button
+            class="theme-toggle"
+            id="theme-toggle"
+            type="button"
+            aria-label="切换浅色主题"
+            aria-pressed="false"
+            title="切换浅色主题"
+          >
+            <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="4"></circle>
+              <path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"></path>
+            </svg>
+            <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path>
+            </svg>
+          </button>
           <a
             class="github-link"
             href="https://github.com/imengying/GptSession"
@@ -59,7 +75,6 @@
             <span>CPA 批量 ZIP</span>
           </div>
         </div>
-
       </section>
 
       <main>

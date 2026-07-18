@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashSet};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use js_sys::Date;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use super::model::{
     ArchiveEntry, DownloadDescriptor, InputMode, JsonMap, NormalizedAccount, OAuthTokenInfo,
@@ -19,7 +20,8 @@ const SESSION_BRIDGE_SCHEMA: i64 = 1;
 const MAX_CPA_FILE_TOKEN_BYTES: usize = 240;
 const MAX_ACCESS_TOKEN_LENGTH: usize = 8 * 1024;
 const MAX_REFRESH_TOKEN_LENGTH: usize = 16 * 1024;
-const MIN_MANUAL_TOKEN_LENGTH: usize = 16;
+const OPENAI_PAT_AUTH_MODE: &str = "personalAccessToken";
+const OPENAI_PAT_LEGACY_AUTH_MODE: &str = "personal_access_token";
 
 const ACCESS_TOKEN_PATHS: &[&str] = &[
     "accessToken",
@@ -203,6 +205,13 @@ fn unix_seconds(value: Option<&Value>) -> Option<i64> {
 
 fn now_iso(now_ms: f64) -> String {
     date_to_iso(now_ms).unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_owned())
+}
+
+fn sha256_hex(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn parse_jwt_payload(token: Option<&str>) -> Option<JsonMap> {
@@ -932,8 +941,7 @@ fn normalize_record(
         .as_deref()
         .map(Date::parse)
         .is_some_and(|expires| expires.is_finite() && expires <= now_ms);
-    let personal_access_token =
-        source_type == SourceType::ManualAt && access_token.starts_with("at-");
+    let personal_access_token = access_token.starts_with("at-");
     let mut warnings = Vec::new();
     if refresh_token.is_none() && !personal_access_token {
         warnings.push("缺少 refresh_token，access token 到期后无法自动刷新。".to_owned());
@@ -1110,13 +1118,6 @@ fn manual_token_error(token: &str, mode: InputMode) -> Option<&'static str> {
     if mode == InputMode::At && !token.starts_with("at-") {
         return Some("AT 仅支持 at- 开头的 Personal Access Token");
     }
-    if token.len() < MIN_MANUAL_TOKEN_LENGTH {
-        return Some(if label == "AT" {
-            "AT 长度过短，请检查是否粘贴完整"
-        } else {
-            "RT 长度过短，请检查是否粘贴完整"
-        });
-    }
     if token.len() > max_length {
         return Some(if label == "AT" {
             "AT 长度超过限制"
@@ -1124,14 +1125,14 @@ fn manual_token_error(token: &str, mode: InputMode) -> Option<&'static str> {
             "RT 长度超过限制"
         });
     }
-    if !token.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric()
-            || matches!(byte, b'.' | b'_' | b'~' | b'+' | b'/' | b'=' | b'-')
-    }) {
+    if !token
+        .chars()
+        .all(|character| !character.is_whitespace() && !character.is_control())
+    {
         return Some(if label == "AT" {
-            "AT 含有空格或非法字符；每行只能填写一个完整 token"
+            "AT 含有空白或控制字符；每行只能填写一个完整 token"
         } else {
-            "RT 含有空格或非法字符；每行只能填写一个完整 token"
+            "RT 含有空白或控制字符；每行只能填写一个完整 token"
         });
     }
     if mode == InputMode::Rt && token.starts_with("at-") {
@@ -1193,10 +1194,10 @@ fn normalize_manual_token(
             )?;
             let credentials = Map::from_iter([
                 ("access_token".to_owned(), json!(token)),
-                ("auth_mode".to_owned(), json!("personal_access_token")),
+                ("auth_mode".to_owned(), json!(OPENAI_PAT_AUTH_MODE)),
                 (
                     "openai_auth_mode".to_owned(),
-                    json!("personal_access_token"),
+                    json!(OPENAI_PAT_LEGACY_AUTH_MODE),
                 ),
                 ("token_type".to_owned(), json!("Bearer")),
             ]);
@@ -1209,6 +1210,8 @@ fn normalize_manual_token(
                     "auth_provider".to_owned(),
                     json!("codex_personal_access_token"),
                 ),
+                ("imported_at".to_owned(), json!(now_iso(now_ms))),
+                ("access_token_sha256".to_owned(), json!(sha256_hex(token))),
             ]);
             let mut settings = manual_settings(credentials, extra, 3.0, 50.0, Some(false));
             settings.name = Some(
@@ -1316,10 +1319,10 @@ pub fn normalize_validated_at(
     }
     let credentials = Map::from_iter([
         ("access_token".to_owned(), json!(token)),
-        ("auth_mode".to_owned(), json!("personal_access_token")),
+        ("auth_mode".to_owned(), json!(OPENAI_PAT_AUTH_MODE)),
         (
             "openai_auth_mode".to_owned(),
-            json!("personal_access_token"),
+            json!(OPENAI_PAT_LEGACY_AUTH_MODE),
         ),
         ("token_type".to_owned(), json!("Bearer")),
         ("email".to_owned(), json!(info.email)),
@@ -1340,6 +1343,8 @@ pub fn normalize_validated_at(
             "auth_provider".to_owned(),
             json!("codex_personal_access_token"),
         ),
+        ("imported_at".to_owned(), json!(now_iso(now_ms))),
+        ("access_token_sha256".to_owned(), json!(sha256_hex(token))),
         ("email".to_owned(), json!(info.email)),
     ]);
     let settings = manual_settings(credentials.clone(), extra, 3.0, 50.0, Some(false));

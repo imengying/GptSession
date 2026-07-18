@@ -22,6 +22,7 @@ const OPENAI_PAT_WHOAMI_URL: &str =
 const OPENAI_OAUTH_SCOPE: &str = "openid profile email";
 const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_MOBILE_CLIENT_ID: &str = "app_LlGpXReQgckcGGUo2JrYvtJK";
+const OPENAI_USER_AGENT: &str = "codex-cli/0.144.5";
 const OPENAI_UNSUPPORTED_REGION_MESSAGE: &str =
     "当前服务器出口地区不受 OpenAI 支持，请检查服务器部署地区或出口代理";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
@@ -30,7 +31,6 @@ const MAX_REQUEST_BYTES: usize = 24 * 1024;
 const MAX_UPSTREAM_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ACCESS_TOKEN_LENGTH: usize = 8 * 1024;
 const MAX_REFRESH_TOKEN_LENGTH: usize = 16 * 1024;
-const MIN_TOKEN_LENGTH: usize = 16;
 const MAX_CONCURRENT_REQUESTS: usize = 64;
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; frame-src 'none'; img-src 'self' data:; media-src 'none'; object-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; worker-src 'none'";
 
@@ -63,7 +63,7 @@ impl ReqwestOpenAiGateway {
             .timeout(REQUEST_TIMEOUT)
             .redirect(Policy::none())
             .https_only(true)
-            .user_agent("session-bridge/0.2.0")
+            .user_agent(OPENAI_USER_AGENT)
             .build()?;
         Ok(Self { client })
     }
@@ -133,6 +133,7 @@ impl OpenAiGateway for ReqwestOpenAiGateway {
             self.client
                 .post(OPENAI_OAUTH_TOKEN_URL)
                 .header(reqwest::header::ACCEPT, "application/json")
+                .header(reqwest::header::USER_AGENT, OPENAI_USER_AGENT)
                 .form(&form)
                 .send()
                 .await,
@@ -150,7 +151,7 @@ impl OpenAiGateway for ReqwestOpenAiGateway {
                     format!("Bearer {access_token}"),
                 )
                 .header("Originator", "codex_cli_rs")
-                .header(reqwest::header::USER_AGENT, "codex-cli/0.91.0")
+                .header(reqwest::header::USER_AGENT, OPENAI_USER_AGENT)
                 .send()
                 .await,
         )
@@ -489,14 +490,14 @@ fn api_json(status: StatusCode, payload: Value) -> Response {
 }
 
 fn token_validation_error(token: &str, token_type: TokenType) -> Option<&'static str> {
+    if token.is_empty() {
+        return Some(match token_type {
+            TokenType::Access => "AT 不能为空",
+            TokenType::Refresh => "RT 不能为空",
+        });
+    }
     if matches!(token_type, TokenType::Access) && !token.starts_with("at-") {
         return Some("AT 仅支持 at- 开头的 Personal Access Token");
-    }
-    if token.len() < MIN_TOKEN_LENGTH {
-        return Some(match token_type {
-            TokenType::Access => "AT 长度过短，请检查是否粘贴完整",
-            TokenType::Refresh => "RT 长度过短，请检查是否粘贴完整",
-        });
     }
     let max_length = match token_type {
         TokenType::Access => MAX_ACCESS_TOKEN_LENGTH,
@@ -508,10 +509,10 @@ fn token_validation_error(token: &str, token_type: TokenType) -> Option<&'static
             TokenType::Refresh => "RT 长度超过限制",
         });
     }
-    if !token.bytes().all(is_token_character) {
+    if !token.chars().all(is_token_character) {
         return Some(match token_type {
-            TokenType::Access => "AT 含有空格或非法字符；每次只能提交一个完整 token",
-            TokenType::Refresh => "RT 含有空格或非法字符；每次只能提交一个完整 token",
+            TokenType::Access => "AT 含有空白或控制字符；每次只能提交一个完整 token",
+            TokenType::Refresh => "RT 含有空白或控制字符；每次只能提交一个完整 token",
         });
     }
     if matches!(token_type, TokenType::Refresh) && token.starts_with("at-") {
@@ -520,8 +521,8 @@ fn token_validation_error(token: &str, token_type: TokenType) -> Option<&'static
     None
 }
 
-const fn is_token_character(value: u8) -> bool {
-    value.is_ascii_alphanumeric() || matches!(value, b'.' | b'_' | b'~' | b'+' | b'/' | b'=' | b'-')
+fn is_token_character(value: char) -> bool {
+    !value.is_whitespace() && !value.is_control()
 }
 
 fn parse_json_object(body: &[u8]) -> Option<Map<String, Value>> {
