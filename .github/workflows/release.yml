@@ -13,11 +13,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  image:
-    name: Publish image
+  publish:
+    name: Publish image and binaries
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - name: Check out repository
@@ -63,39 +63,25 @@ jobs:
           cache-from: type=gha,scope=release
           cache-to: type=gha,mode=max,scope=release
 
-  binaries:
-    name: Publish binaries
-    needs: image
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build binaries
+      - name: Extract release binaries
         shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           mkdir -p dist/amd64 dist/arm64 release
-          docker buildx build \
-            --platform linux/amd64 \
-            --target binary \
-            --output type=local,dest=dist/amd64 \
-            --cache-from type=gha,scope=release \
-            .
-          docker buildx build \
-            --platform linux/arm64 \
-            --target binary \
-            --output type=local,dest=dist/arm64 \
-            --cache-from type=gha,scope=release \
-            .
+
+          docker pull --platform linux/amd64 "$IMAGE:$TAG"
+          amd64_container=$(docker create --platform linux/amd64 "$IMAGE:$TAG")
+          docker cp "$amd64_container:/usr/local/bin/session-bridge" dist/amd64/session-bridge
+          docker rm "$amd64_container"
+
+          docker pull --platform linux/arm64 "$IMAGE:$TAG"
+          arm64_container=$(docker create --platform linux/arm64 "$IMAGE:$TAG")
+          docker cp "$arm64_container:/usr/local/bin/session-bridge" dist/arm64/session-bridge
+          docker rm "$arm64_container"
+
           tar -C dist/amd64 -czf release/session-bridge-linux-amd64.tar.gz session-bridge
           tar -C dist/arm64 -czf release/session-bridge-linux-arm64.tar.gz session-bridge
           cd release

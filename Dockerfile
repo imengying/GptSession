@@ -33,9 +33,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --locked --release --bin session-bridge \
     && cp target/release/session-bridge /usr/local/bin/session-bridge
 
-FROM scratch AS binary
-COPY --from=server-builder /usr/local/bin/session-bridge /session-bridge
-
 FROM debian:bookworm-slim AS app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
