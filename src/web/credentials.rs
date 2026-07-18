@@ -752,7 +752,10 @@ fn normalize_record(
     } = options;
     let uses_settings = matches!(
         source_type,
-        SourceType::Sub2Api | SourceType::ManualAt | SourceType::ManualRt
+        SourceType::Sub2Api
+            | SourceType::ManualAt
+            | SourceType::ManualRt
+            | SourceType::ManualMobileRt
     );
     if uses_settings
         && sub2api_settings
@@ -775,7 +778,7 @@ fn normalize_record(
     let refresh_token = read_first_string(record, REFRESH_TOKEN_PATHS);
     let supports_refresh_only = matches!(
         source_type,
-        SourceType::Sub2Api | SourceType::Cpa | SourceType::ManualRt
+        SourceType::Sub2Api | SourceType::Cpa | SourceType::ManualRt | SourceType::ManualMobileRt
     );
     if access_token.is_empty() && !(supports_refresh_only && refresh_token.is_some()) {
         return Err("缺少 access_token / accessToken 或 refresh_token".to_owned());
@@ -1110,32 +1113,34 @@ fn detect_non_token_document(text: &str) -> Option<&'static str> {
 }
 
 fn manual_token_error(token: &str, mode: InputMode) -> Option<&'static str> {
-    let (label, max_length) = match mode {
-        InputMode::At => ("AT", MAX_ACCESS_TOKEN_LENGTH),
-        InputMode::Rt => ("RT", MAX_REFRESH_TOKEN_LENGTH),
-        InputMode::Json => return Some("请选择 AT 或 RT 输入"),
+    let max_length = match mode {
+        InputMode::At => MAX_ACCESS_TOKEN_LENGTH,
+        InputMode::Rt | InputMode::MobileRt => MAX_REFRESH_TOKEN_LENGTH,
+        InputMode::Json => return Some("请选择 RT、Mobile RT 或 AT 输入"),
     };
     if mode == InputMode::At && !token.starts_with("at-") {
         return Some("AT 仅支持 at- 开头的 Personal Access Token");
     }
     if token.len() > max_length {
-        return Some(if label == "AT" {
-            "AT 长度超过限制"
-        } else {
-            "RT 长度超过限制"
+        return Some(match mode {
+            InputMode::At => "AT 长度超过限制",
+            InputMode::MobileRt => "Mobile RT 长度超过限制",
+            InputMode::Rt => "RT 长度超过限制",
+            InputMode::Json => "Token 长度超过限制",
         });
     }
     if !token
         .chars()
         .all(|character| !character.is_whitespace() && !character.is_control())
     {
-        return Some(if label == "AT" {
-            "AT 含有空白或控制字符；每行只能填写一个完整 token"
-        } else {
-            "RT 含有空白或控制字符；每行只能填写一个完整 token"
+        return Some(match mode {
+            InputMode::At => "AT 含有空白或控制字符；每行只能填写一个完整 token",
+            InputMode::MobileRt => "Mobile RT 含有空白或控制字符；每行只能填写一个完整 token",
+            InputMode::Rt => "RT 含有空白或控制字符；每行只能填写一个完整 token",
+            InputMode::Json => "Token 含有空白或控制字符",
         });
     }
-    if mode == InputMode::Rt && token.starts_with("at-") {
+    if matches!(mode, InputMode::Rt | InputMode::MobileRt) && token.starts_with("at-") {
         return Some("检测到 AT，请切换到 AT 输入");
     }
     None
@@ -1223,16 +1228,31 @@ fn normalize_manual_token(
             account.sub2api_settings = Some(settings);
             Ok(account)
         }
-        InputMode::Rt => {
+        InputMode::Rt | InputMode::MobileRt => {
+            let mobile = mode == InputMode::MobileRt;
+            let source_type = if mobile {
+                SourceType::ManualMobileRt
+            } else {
+                SourceType::ManualRt
+            };
+            let token_label = if mobile { "Mobile RT" } else { "RT" };
+            let import_source = if mobile {
+                "manual_mobile_refresh_token"
+            } else {
+                "manual_refresh_token"
+            };
             let credentials = Map::from_iter([("refresh_token".to_owned(), json!(token))]);
             let extra = Map::from_iter([
                 ("auth_provider".to_owned(), json!("openai")),
-                ("source".to_owned(), json!("manual_refresh_token")),
+                ("source".to_owned(), json!(import_source)),
             ]);
             let mut settings = manual_settings(credentials, extra, 10.0, 1.0, None);
             let record = Map::from_iter([
                 ("refresh_token".to_owned(), json!(token)),
-                ("name".to_owned(), json!(format!("OpenAI RT {}", index + 1))),
+                (
+                    "name".to_owned(),
+                    json!(format!("OpenAI {token_label} {}", index + 1)),
+                ),
                 ("auth_provider".to_owned(), json!("openai")),
             ]);
             let mut account = normalize_record(
@@ -1240,7 +1260,7 @@ fn normalize_manual_token(
                 NormalizeOptions {
                     source_name,
                     source_path: &source_path,
-                    source_type: SourceType::ManualRt,
+                    source_type,
                     last_refresh_fallback: None,
                     preserved_cpa_fields: None,
                     sub2api_settings: Some(settings.clone()),
@@ -1252,7 +1272,7 @@ fn normalize_manual_token(
             account.warnings.clear();
             Ok(account)
         }
-        InputMode::Json => Err("请选择 AT 或 RT 输入".to_owned()),
+        InputMode::Json => Err("请选择 RT、Mobile RT 或 AT 输入".to_owned()),
     }
 }
 
@@ -1287,10 +1307,13 @@ pub fn parse_manual_tokens(
             issues.push(ParseIssue::new(source_name, reason).at_path(format!("$[{index}]")));
             continue;
         }
-        let key = format!(
-            "{}:{token}",
-            if mode == InputMode::At { "at" } else { "rt" }
-        );
+        let token_kind = match mode {
+            InputMode::At => "at",
+            InputMode::Rt => "rt",
+            InputMode::MobileRt => "mobile_rt",
+            InputMode::Json => "json",
+        };
+        let key = format!("{token_kind}:{token}");
         if !seen.insert(key) {
             issues.push(
                 ParseIssue::new(source_name, "检测到重复凭证，已忽略")
@@ -1382,9 +1405,27 @@ pub fn normalize_validated_at(
 pub fn normalize_refreshed_rt(
     original_refresh_token: &str,
     info: &OAuthTokenInfo,
+    mode: InputMode,
     index: usize,
     now_ms: f64,
 ) -> Result<NormalizedAccount, String> {
+    let mobile = mode == InputMode::MobileRt;
+    let source_name = if mobile {
+        "手动 Mobile RT"
+    } else {
+        "手动 RT"
+    };
+    let source_type = if mobile {
+        SourceType::ManualMobileRt
+    } else {
+        SourceType::ManualRt
+    };
+    let import_source = if mobile {
+        "manual_mobile_refresh_token"
+    } else {
+        "manual_refresh_token"
+    };
+    let token_label = if mobile { "Mobile RT" } else { "RT" };
     let access_token = info
         .fields
         .get("access_token")
@@ -1425,7 +1466,7 @@ pub fn normalize_refreshed_rt(
     }
     let mut extra = Map::from_iter([
         ("auth_provider".to_owned(), json!("openai")),
-        ("source".to_owned(), json!("manual_refresh_token")),
+        ("source".to_owned(), json!(import_source)),
     ]);
     for key in ["email", "name", "privacy_mode"] {
         if let Some(value) = info.fields.get(key).and_then(non_empty) {
@@ -1440,9 +1481,9 @@ pub fn normalize_refreshed_rt(
             first_non_empty([
                 info.fields.get("name").and_then(non_empty),
                 info.fields.get("email").and_then(non_empty),
-                Some(format!("OpenAI RT {}", index + 1)),
+                Some(format!("OpenAI {token_label} {}", index + 1)),
             ])
-            .unwrap_or_else(|| format!("OpenAI RT {}", index + 1))
+            .unwrap_or_else(|| format!("OpenAI {token_label} {}", index + 1))
         ),
     );
     record.insert("auth_provider".to_owned(), json!("openai"));
@@ -1451,9 +1492,9 @@ pub fn normalize_refreshed_rt(
     let mut account = normalize_record(
         &record,
         NormalizeOptions {
-            source_name: "手动 RT",
+            source_name,
             source_path: &source_path,
-            source_type: SourceType::ManualRt,
+            source_type,
             last_refresh_fallback: None,
             preserved_cpa_fields: None,
             sub2api_settings: Some(settings),
@@ -1508,7 +1549,10 @@ pub fn to_cpa_record(account: &NormalizedAccount, now_ms: f64) -> Value {
     ]);
     let generated_name = matches!(
         account.source_type,
-        SourceType::Sub2Api | SourceType::ManualAt | SourceType::ManualRt
+        SourceType::Sub2Api
+            | SourceType::ManualAt
+            | SourceType::ManualRt
+            | SourceType::ManualMobileRt
     )
     .then(|| {
         account.email.as_ref().map(|email| {

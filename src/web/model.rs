@@ -13,8 +13,9 @@ pub enum OutputFormat {
 pub enum InputMode {
     #[default]
     Json,
-    At,
     Rt,
+    MobileRt,
+    At,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -24,6 +25,7 @@ pub enum SourceType {
     Sub2Api,
     ManualAt,
     ManualRt,
+    ManualMobileRt,
 }
 
 impl SourceType {
@@ -34,6 +36,7 @@ impl SourceType {
             Self::Sub2Api => "Sub2API",
             Self::ManualAt => "AT",
             Self::ManualRt => "RT",
+            Self::ManualMobileRt => "Mobile RT",
         }
     }
 
@@ -44,6 +47,7 @@ impl SourceType {
             Self::Sub2Api => "sub2api",
             Self::ManualAt => "manual_at",
             Self::ManualRt => "manual_rt",
+            Self::ManualMobileRt => "manual_mobile_rt",
         }
     }
 }

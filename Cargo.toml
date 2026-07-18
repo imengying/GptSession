@@ -20,7 +20,7 @@ mime_guess = "2.0.5"
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "http2", "rustls"] }
 rust-embed = "8.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.53.0", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1.53.0", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tower = { version = "0.5.3", features = ["limit"] }
 
 [target.'cfg(target_arch = "wasm64")'.dependencies]

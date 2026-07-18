@@ -579,7 +579,7 @@ a {
 
 .input-mode-switch {
   display: grid;
-  grid-template-columns: repeat(3, minmax(48px, 1fr));
+  grid-template-columns: repeat(4, minmax(68px, 1fr));
   gap: 3px;
   padding: 3px;
   border: 1px solid var(--line);
@@ -590,7 +590,7 @@ a {
 .input-mode-option {
   appearance: none;
   min-height: 31px;
-  padding: 6px 11px;
+  padding: 6px 9px;
   border: 1px solid transparent;
   border-radius: 8px;
   color: var(--muted);
@@ -598,6 +598,7 @@ a {
   font-family: var(--mono);
   font-size: 0.65rem;
   font-weight: 700;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -1009,6 +1010,12 @@ tbody tr:hover:not(.empty-row) {
   background: rgb(var(--success-rgb) / 0.07);
 }
 
+.source-chip.source-manual_mobile_rt {
+  border-color: rgb(var(--brand-rgb) / 0.24);
+  color: var(--brand);
+  background: rgb(var(--brand-rgb) / 0.07);
+}
+
 .status-stack {
   display: flex;
   flex-direction: column;
@@ -1316,11 +1323,19 @@ tbody tr:hover:not(.empty-row) {
   }
 
   .input-mode-group {
+    width: 100%;
     justify-content: space-between;
   }
 
   .input-mode-switch {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    width: 100%;
     flex: 1;
+  }
+
+  .input-mode-option {
+    padding-inline: 5px;
+    font-size: 0.59rem;
   }
 
   .input-toolbar.is-token-mode .input-actions {

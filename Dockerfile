@@ -10,6 +10,8 @@ RUN rustup toolchain install "${WASM_RUST_TOOLCHAIN}" \
     && cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}" --locked
 COPY Cargo.toml Cargo.lock ./
 COPY src src
+# wasm-bindgen 0.2.126 leaves Result-returning callbacks with a 32-bit stack
+# pointer at one memory64 boundary. JavaScript must widen it to i64.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo +"${WASM_RUST_TOOLCHAIN}" \
@@ -19,7 +21,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --target web \
         --no-typescript \
         --out-dir src/static/assets \
-        --out-name session_bridge_web
+        --out-name session_bridge_web \
+    && sed -E -i \
+        's/(wasm\.__wasm_bindgen_func_elem_[[:alnum:]_]+)\(retptr,/\1(BigInt(retptr),/g' \
+        src/static/assets/session_bridge_web.js \
+    && ! grep -Eq \
+        'wasm\.__wasm_bindgen_func_elem_[[:alnum:]_]+\(retptr,' \
+        src/static/assets/session_bridge_web.js
 
 FROM rust:1.97.0-bookworm AS server-builder
 WORKDIR /app

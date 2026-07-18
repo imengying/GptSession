@@ -29,6 +29,8 @@ const MAX_TOTAL_IMPORT_SIZE: usize = 50 * 1024 * 1024;
 const MAX_MANUAL_INPUT_SIZE: usize = 8 * 1024 * 1024;
 const MAX_FILES: usize = 500;
 const TOKEN_VALIDATION_CONCURRENCY: usize = 3;
+const TOKEN_VALIDATION_WATCHDOG_PER_BATCH_MS: i32 = 15_000;
+const TOKEN_VALIDATION_WATCHDOG_MARGIN_MS: i32 = 5_000;
 
 type SharedApp = Rc<RefCell<App>>;
 
@@ -233,8 +235,9 @@ fn warning_count(app: &App) -> usize {
 fn render_input(app: &App) -> Result<(), JsValue> {
     for (id, mode) in [
         ("input-mode-json", InputMode::Json),
-        ("input-mode-at", InputMode::At),
         ("input-mode-rt", InputMode::Rt),
+        ("input-mode-mobile-rt", InputMode::MobileRt),
+        ("input-mode-at", InputMode::At),
     ] {
         let button: HtmlButtonElement = by_id(id)?;
         let active = app.input_mode == mode;
@@ -270,16 +273,30 @@ fn render_input(app: &App) -> Result<(), JsValue> {
         InputMode::Rt => {
             set_text(
                 "input-description",
-                "粘贴 Refresh Token，自动换取完整凭证后导出 Sub2API 或 CPA。",
+                "粘贴 Codex CLI Refresh Token，换取完整凭证后导出 Sub2API 或 CPA。",
             )?;
-            set_text("input-guide-title", "手动输入 Refresh Token")?;
+            set_text("input-guide-title", "手动输入 RT")?;
             set_text(
                 "input-guide-description",
-                "输入后自动通过本站验证服务连接 OpenAI 换取完整凭证。",
+                "输入后通过 Codex CLI OAuth 客户端连接 OpenAI 换取完整凭证。",
             )?;
-            set_text("input-content-label", "Refresh Token")?;
-            set_text("input-hint", "每行一个 · 自动去重 · 自动匹配 OAuth 客户端")?;
-            input.set_placeholder("每行粘贴一个 Refresh Token");
+            set_text("input-content-label", "RT")?;
+            set_text("input-hint", "每行一个 · 自动去重 · 联网验证账号信息")?;
+            input.set_placeholder("每行粘贴一个 Codex CLI RT");
+        }
+        InputMode::MobileRt => {
+            set_text(
+                "input-description",
+                "粘贴 OpenAI Mobile Refresh Token，换取完整凭证后导出 Sub2API 或 CPA。",
+            )?;
+            set_text("input-guide-title", "手动输入 Mobile RT")?;
+            set_text(
+                "input-guide-description",
+                "输入后通过 OpenAI Mobile OAuth 客户端连接 OpenAI 换取完整凭证。",
+            )?;
+            set_text("input-content-label", "Mobile RT")?;
+            set_text("input-hint", "每行一个 · 自动去重 · 联网验证账号信息")?;
+            input.set_placeholder("每行粘贴一个 Mobile RT");
         }
         InputMode::Json => {
             set_text(
@@ -640,7 +657,12 @@ fn process_json_input(shared: &SharedApp) -> Result<(), JsValue> {
 }
 
 fn token_label(mode: InputMode) -> &'static str {
-    if mode == InputMode::At { "AT" } else { "RT" }
+    match mode {
+        InputMode::Json => "JSON",
+        InputMode::Rt => "RT",
+        InputMode::MobileRt => "Mobile RT",
+        InputMode::At => "AT",
+    }
 }
 
 fn prepare_manual_input(shared: &SharedApp) -> Result<Option<ParseResult>, JsValue> {
@@ -653,14 +675,13 @@ fn prepare_manual_input(shared: &SharedApp) -> Result<Option<ParseResult>, JsVal
         cancel_operation(&mut app);
         reset_results(&mut app);
         render(&app)?;
-        set_input_status(
-            if mode == InputMode::At {
-                "请先粘贴 Access Token。"
-            } else {
-                "请先粘贴 Refresh Token。"
-            },
-            Some("error"),
-        )?;
+        let message = match mode {
+            InputMode::At => "请先粘贴 Access Token。",
+            InputMode::MobileRt => "请先粘贴 Mobile RT。",
+            InputMode::Rt => "请先粘贴 RT。",
+            InputMode::Json => "请先粘贴 JSON。",
+        };
+        set_input_status(message, Some("error"))?;
         return Ok(None);
     }
     if text.len() > MAX_MANUAL_INPUT_SIZE {
@@ -715,6 +736,48 @@ fn should_stop_batch(reason: &str) -> bool {
     .any(|needle| reason.contains(needle))
 }
 
+fn schedule_validation_watchdog(
+    shared: SharedApp,
+    operation_id: u64,
+    label: &'static str,
+    total: usize,
+) -> Result<(), JsValue> {
+    let batches = total.div_ceil(TOKEN_VALIDATION_CONCURRENCY);
+    let delay_ms = i32::try_from(batches)
+        .unwrap_or(i32::MAX)
+        .saturating_mul(TOKEN_VALIDATION_WATCHDOG_PER_BATCH_MS)
+        .saturating_add(TOKEN_VALIDATION_WATCHDOG_MARGIN_MS);
+    let callback = Closure::once_into_js(move || {
+        let timed_out = {
+            let mut app = shared.borrow_mut();
+            if app.operation_id != operation_id || !app.validation_in_progress {
+                false
+            } else {
+                app.operation_id = app.operation_id.wrapping_add(1);
+                app.validation_in_progress = false;
+                app.issues.push(ParseIssue::new(
+                    format!("手动 {label}"),
+                    "联网验证超时，已停止本次验证；请检查服务端网络后重试",
+                ));
+                let _ = render(&app);
+                true
+            }
+        };
+        if timed_out {
+            let _ = set_input_status(
+                &format!("{label} 联网验证超时，已停止本次验证。"),
+                Some("error"),
+            );
+            let _ = show_toast(&format!("{label} 联网验证超时"), true);
+        }
+    });
+    window()?.set_timeout_with_callback_and_timeout_and_arguments_0(
+        callback.unchecked_ref(),
+        delay_ms,
+    )?;
+    Ok(())
+}
+
 fn start_manual_validation(shared: SharedApp) -> Result<(), JsValue> {
     let Some(parsed) = prepare_manual_input(&shared)? else {
         show_toast("Token 输入格式无效", true)?;
@@ -729,15 +792,25 @@ fn start_manual_validation(shared: SharedApp) -> Result<(), JsValue> {
         render_input(&app)?;
         app.operation_id
     };
+    let total = parsed.accounts.len();
+    let first_chunk_end = total.min(TOKEN_VALIDATION_CONCURRENCY);
+    let first_range = if first_chunk_end == 1 {
+        "1".to_owned()
+    } else {
+        format!("1 - {first_chunk_end}")
+    };
     set_input_status(
-        &format!(
-            "正在连接 OpenAI 验证 {label}：准备验证 {} 个…",
-            parsed.accounts.len()
-        ),
+        &format!("正在连接 OpenAI 验证 {label}：正在处理 {first_range} / {total}…"),
         Some("working"),
     )?;
+    if let Err(error) = schedule_validation_watchdog(Rc::clone(&shared), operation_id, label, total)
+    {
+        let mut app = shared.borrow_mut();
+        app.validation_in_progress = false;
+        render_input(&app)?;
+        return Err(error);
+    }
     spawn_local(async move {
-        let total = parsed.accounts.len();
         let mut resolved = vec![None; total];
         let mut network_issues = Vec::new();
         let mut completed = 0;
@@ -769,16 +842,23 @@ fn start_manual_validation(shared: SharedApp) -> Result<(), JsValue> {
                         } else {
                             source.refresh_token.clone()
                         };
-                        let result = match token.as_deref() {
-                            Some(token) if mode == InputMode::At => {
+                        let result = match (mode, token.as_deref()) {
+                            (InputMode::At, Some(token)) => {
                                 api::validate_access_token(token).await.and_then(|info| {
                                     normalize_validated_at(token, &info, index, Date::now())
                                 })
                             }
-                            Some(token) => api::refresh_token(token).await.and_then(|info| {
-                                normalize_refreshed_rt(token, &info, index, Date::now())
-                            }),
-                            None => Err(format!("未找到可验证的 {label}")),
+                            (InputMode::Rt, Some(token)) => {
+                                api::refresh_token(token).await.and_then(|info| {
+                                    normalize_refreshed_rt(token, &info, mode, index, Date::now())
+                                })
+                            }
+                            (InputMode::MobileRt, Some(token)) => {
+                                api::refresh_mobile_token(token).await.and_then(|info| {
+                                    normalize_refreshed_rt(token, &info, mode, index, Date::now())
+                                })
+                            }
+                            _ => Err(format!("未找到可验证的 {label}")),
                         };
                         (index, source, result)
                     }
@@ -1178,8 +1258,9 @@ fn bind_segmented_controls(shared: &SharedApp) -> Result<(), JsValue> {
     }
     for (id, mode) in [
         ("input-mode-json", InputMode::Json),
-        ("input-mode-at", InputMode::At),
         ("input-mode-rt", InputMode::Rt),
+        ("input-mode-mobile-rt", InputMode::MobileRt),
+        ("input-mode-at", InputMode::At),
     ] {
         let button: HtmlButtonElement = by_id(id)?;
         let click_shared = Rc::clone(shared);

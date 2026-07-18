@@ -32,6 +32,14 @@ impl ApiError {
     }
 }
 
+fn format_api_error(error: ApiError) -> String {
+    if error.status == 0 {
+        format!("{}（{}）", error.message, error.code)
+    } else {
+        format!("{}（HTTP {}，{}）", error.message, error.status, error.code)
+    }
+}
+
 fn string_field(record: &JsonMap, key: &str) -> Option<String> {
     record
         .get(key)
@@ -127,12 +135,49 @@ async fn post_json(endpoint: &str, body: &Value, label: &str) -> Result<JsonMap,
         .map_err(|error| ApiError::new(js_error(error), 0, "OPENAI_VALIDATION_REQUEST_FAILED"))?;
 
     let fetched = JsFuture::from(window.fetch_with_str_and_init(endpoint, &init)).await;
+    let response = match fetched {
+        Ok(value) => match value.dyn_into::<Response>() {
+            Ok(response) => response,
+            Err(error) => {
+                window.clear_timeout_with_handle(timeout_id);
+                drop(timeout);
+                return Err(ApiError::new(
+                    js_error(error),
+                    0,
+                    "OPENAI_VALIDATION_RESPONSE_INVALID",
+                ));
+            }
+        },
+        Err(error) => {
+            window.clear_timeout_with_handle(timeout_id);
+            drop(timeout);
+            return if timed_out.get() {
+                Err(ApiError::new(
+                    format!("{label} 联网验证超时，请稍后重试或检查服务器网络"),
+                    0,
+                    "OPENAI_VALIDATION_TIMEOUT",
+                ))
+            } else {
+                Err(ApiError::new(
+                    format!(
+                        "无法连接 {label} 联网验证接口，请稍后重试：{}",
+                        js_error(error)
+                    ),
+                    0,
+                    "OPENAI_VALIDATION_REQUEST_FAILED",
+                ))
+            };
+        }
+    };
+    let status = response.status();
+    let text = match response.text() {
+        Ok(promise) => JsFuture::from(promise).await,
+        Err(error) => Err(error),
+    };
     window.clear_timeout_with_handle(timeout_id);
     drop(timeout);
-    let response = match fetched {
-        Ok(value) => value.dyn_into::<Response>().map_err(|error| {
-            ApiError::new(js_error(error), 0, "OPENAI_VALIDATION_RESPONSE_INVALID")
-        })?,
+    let text = match text {
+        Ok(value) => value.as_string().unwrap_or_default(),
         Err(_error) if timed_out.get() => {
             return Err(ApiError::new(
                 format!("{label} 联网验证超时，请稍后重试或检查服务器网络"),
@@ -142,34 +187,12 @@ async fn post_json(endpoint: &str, body: &Value, label: &str) -> Result<JsonMap,
         }
         Err(error) => {
             return Err(ApiError::new(
-                format!(
-                    "无法连接 {label} 联网验证接口，请稍后重试：{}",
-                    js_error(error)
-                ),
-                0,
-                "OPENAI_VALIDATION_REQUEST_FAILED",
-            ));
-        }
-    };
-    let status = response.status();
-    let text = response.text().map_err(|error| {
-        ApiError::new(
-            js_error(error),
-            status,
-            "OPENAI_VALIDATION_RESPONSE_INVALID",
-        )
-    })?;
-    let text = JsFuture::from(text)
-        .await
-        .map_err(|error| {
-            ApiError::new(
                 js_error(error),
                 status,
                 "OPENAI_VALIDATION_RESPONSE_INVALID",
-            )
-        })?
-        .as_string()
-        .unwrap_or_default();
+            ));
+        }
+    };
     let payload = serde_json::from_str::<Value>(&text)
         .ok()
         .and_then(|value| value.as_object().cloned())
@@ -225,23 +248,15 @@ async fn request_refresh_token(
 }
 
 pub async fn refresh_token(refresh_token: &str) -> Result<OAuthTokenInfo, String> {
-    let (primary_client_id, fallback_client_id) = if refresh_token.starts_with("rt.1.") {
-        (OPENAI_MOBILE_CLIENT_ID, OPENAI_CODEX_CLIENT_ID)
-    } else {
-        (OPENAI_CODEX_CLIENT_ID, OPENAI_MOBILE_CLIENT_ID)
-    };
-    match request_refresh_token(refresh_token, primary_client_id).await {
-        Ok(info) => Ok(info),
-        Err(error)
-            if matches!(error.status, 400 | 401)
-                && !error.code.to_ascii_lowercase().contains("reused") =>
-        {
-            request_refresh_token(refresh_token, fallback_client_id)
-                .await
-                .map_err(|error| format!("{}（{}）", error.message, error.code))
-        }
-        Err(error) => Err(format!("{}（{}）", error.message, error.code)),
-    }
+    request_refresh_token(refresh_token, OPENAI_CODEX_CLIENT_ID)
+        .await
+        .map_err(format_api_error)
+}
+
+pub async fn refresh_mobile_token(refresh_token: &str) -> Result<OAuthTokenInfo, String> {
+    request_refresh_token(refresh_token, OPENAI_MOBILE_CLIENT_ID)
+        .await
+        .map_err(format_api_error)
 }
 
 pub async fn validate_access_token(access_token: &str) -> Result<PersonalAccessTokenInfo, String> {
@@ -251,7 +266,7 @@ pub async fn validate_access_token(access_token: &str) -> Result<PersonalAccessT
         "AT",
     )
     .await
-    .map_err(|error| format!("{}（{}）", error.message, error.code))?;
+    .map_err(format_api_error)?;
     let required = [
         ("email", "邮箱"),
         ("chatgpt_user_id", "user_id"),

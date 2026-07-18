@@ -5,15 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="转换 ChatGPT Web Session、Sub2API 与 CPA 凭证，并支持 AT / RT 联网验证。"
+      content="转换 ChatGPT Web Session、Sub2API 与 CPA 凭证，并支持 RT、Mobile RT 与 AT 联网验证。"
     />
     <meta name="theme-color" content="#09090b" />
     <meta name="color-scheme" content="dark light" />
     <title>Session Bridge</title>
-    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/theme.css" />
-    <link rel="stylesheet" href="/styles.css" />
-    <script type="module" src="/app.js"></script>
+    <link rel="icon" href="/assets/favicon.svg?v=20260718-4" type="image/svg+xml" />
+    <link rel="stylesheet" href="/theme.css?v=20260718-4" />
+    <link rel="stylesheet" href="/styles.css?v=20260718-4" />
+    <script type="module" src="/app.js?v=20260718-4"></script>
   </head>
   <body>
     <div class="page-shell">
@@ -30,7 +30,7 @@
         </div>
         <div class="topbar-meta">
           <span class="live-dot"><i></i> 本地转换</span>
-          <span>AT / RT 联网验证</span>
+          <span>RT / Mobile RT / AT 联网验证</span>
           <span>不持久化</span>
           <button
             class="theme-toggle"
@@ -66,7 +66,7 @@
       <section class="hero">
         <div class="hero-copy">
           <p class="hero-lead">
-            导入 ChatGPT Web Session、Sub2API 或 CPA 凭证；转换、预览与打包在浏览器内完成，AT 与 RT 通过同源接口联网验证。
+            导入 ChatGPT Web Session、Sub2API 或 CPA 凭证；转换、预览与打包在浏览器内完成，RT、Mobile RT 与 AT 通过同源接口联网验证。
           </p>
           <div class="hero-pills" aria-label="当前能力">
             <span>Session → Sub2API</span>
@@ -168,14 +168,6 @@
                       aria-checked="true"
                     >JSON</button>
                     <button
-                      id="input-mode-at"
-                      class="input-mode-option"
-                      type="button"
-                      data-input-mode="at"
-                      role="radio"
-                      aria-checked="false"
-                    >AT</button>
-                    <button
                       id="input-mode-rt"
                       class="input-mode-option"
                       type="button"
@@ -183,6 +175,22 @@
                       role="radio"
                       aria-checked="false"
                     >RT</button>
+                    <button
+                      id="input-mode-mobile-rt"
+                      class="input-mode-option"
+                      type="button"
+                      data-input-mode="mobile-rt"
+                      role="radio"
+                      aria-checked="false"
+                    >Mobile RT</button>
+                    <button
+                      id="input-mode-at"
+                      class="input-mode-option"
+                      type="button"
+                      data-input-mode="at"
+                      role="radio"
+                      aria-checked="false"
+                    >AT</button>
                   </div>
                 </div>
                 <div class="input-actions">

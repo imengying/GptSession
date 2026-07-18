@@ -27,6 +27,7 @@ const OPENAI_UNSUPPORTED_REGION_MESSAGE: &str =
     "当前服务器出口地区不受 OpenAI 支持，请检查服务器部署地区或出口代理";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDLER_TIMEOUT: Duration = Duration::from_secs(13);
 const MAX_REQUEST_BYTES: usize = 24 * 1024;
 const MAX_UPSTREAM_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ACCESS_TOKEN_LENGTH: usize = 8 * 1024;
@@ -260,9 +261,7 @@ async fn api_not_found() -> Response {
 }
 
 async fn security_headers(request: Request, next: Next) -> Response {
-    let request_path = request.uri().path().to_owned();
     let mut response = next.run(request).await;
-    let response_is_success = response.status().is_success();
     let headers = response.headers_mut();
 
     insert_header_if_absent(headers, "content-security-policy", CONTENT_SECURITY_POLICY);
@@ -279,18 +278,9 @@ async fn security_headers(request: Request, next: Next) -> Response {
     insert_header_if_absent(headers, "x-frame-options", "DENY");
 
     if !headers.contains_key(header::CACHE_CONTROL) {
-        let cache_control = if !response_is_success {
-            "no-cache"
-        } else if request_path.starts_with("/assets/") {
-            "public, max-age=3600, must-revalidate"
-        } else if request_path == "/theme.css" {
-            "public, max-age=3600"
-        } else {
-            "no-cache"
-        };
         headers.insert(
             header::CACHE_CONTROL,
-            HeaderValue::from_static(cache_control),
+            HeaderValue::from_static("no-store, max-age=0"),
         );
     }
 
@@ -336,9 +326,20 @@ async fn refresh_handler(
         );
     }
 
-    let upstream = match state.gateway.refresh(refresh_token, client_id).await {
-        Ok(response) => response,
-        Err(error) => return gateway_error(error),
+    let upstream = match tokio::time::timeout(
+        HANDLER_TIMEOUT,
+        state.gateway.refresh(refresh_token, client_id),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => return gateway_error(error),
+        Err(_) => {
+            return gateway_error(GatewayError::new(
+                "OPENAI_UPSTREAM_TIMEOUT",
+                "连接 OpenAI 超时，请稍后重试",
+            ));
+        }
     };
     let Some(payload) = parse_json_object(&upstream.body) else {
         return api_error(
@@ -375,10 +376,17 @@ async fn whoami_handler(
         );
     }
 
-    let upstream = match state.gateway.whoami(access_token).await {
-        Ok(response) => response,
-        Err(error) => return gateway_error(error),
-    };
+    let upstream =
+        match tokio::time::timeout(HANDLER_TIMEOUT, state.gateway.whoami(access_token)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return gateway_error(error),
+            Err(_) => {
+                return gateway_error(GatewayError::new(
+                    "OPENAI_UPSTREAM_TIMEOUT",
+                    "连接 OpenAI 超时，请稍后重试",
+                ));
+            }
+        };
     let Some(payload) = parse_json_object(&upstream.body) else {
         return api_error(
             StatusCode::BAD_GATEWAY,
