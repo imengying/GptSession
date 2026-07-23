@@ -51,7 +51,6 @@ arm64 服务器将文件名中的 `amd64` 改为 `arm64`。服务固定监听 `0
 
 ## 友链
 
-- **LinuxDo** — <https://linux.do>
 - **NodeSeek** — <https://www.nodeseek.com>
 
 ## License
