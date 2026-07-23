@@ -9,13 +9,18 @@ use web_sys::{
 };
 
 use super::{
-    credentials::{OPENAI_CODEX_CLIENT_ID, OPENAI_MOBILE_CLIENT_ID},
-    model::{JsonMap, OAuthTokenInfo, PersonalAccessTokenInfo},
+    credentials::{OPENAI_CODEX_CLIENT_ID, OPENAI_MOBILE_CLIENT_ID, classify_refresh_token},
+    model::{JsonMap, OAuthTokenInfo, PersonalAccessTokenInfo, RefreshTokenKind},
 };
 
-const REQUEST_TIMEOUT_MS: i32 = 15_000;
+const OPENAI_REQUEST_TIMEOUT_MS: i32 = 15_000;
+const GROK_REQUEST_TIMEOUT_MS: i32 = 20_000;
+const GROK_SSO_REQUEST_TIMEOUT_MS: i32 = 96_000;
+const VALIDATION_ENVIRONMENT_INVALID: &str = "VALIDATION_ENVIRONMENT_INVALID";
+const VALIDATION_REQUEST_FAILED: &str = "VALIDATION_REQUEST_FAILED";
+const VALIDATION_RESPONSE_INVALID: &str = "VALIDATION_RESPONSE_INVALID";
+const VALIDATION_TIMEOUT: &str = "VALIDATION_TIMEOUT";
 
-#[derive(Debug)]
 struct ApiError {
     message: String,
     status: u16,
@@ -85,7 +90,7 @@ fn http_error_message(label: &str, status: u16, plain_text: Option<&str>) -> Str
             .eq_ignore_ascii_case(&format!("error code: {status}"))
     });
     if status == 502 && (platform_error || plain_text.is_some_and(looks_like_html)) {
-        return format!("{label} 联网验证暂不可用；验证服务器连接 OpenAI 失败，请稍后重试");
+        return format!("{label} 联网验证暂不可用；验证服务器连接上游服务失败，请稍后重试");
     }
     if let Some(text) = plain_text
         .map(str::trim)
@@ -96,21 +101,22 @@ fn http_error_message(label: &str, status: u16, plain_text: Option<&str>) -> Str
     format!("{label} 联网验证接口返回 HTTP {status}")
 }
 
-async fn post_json(endpoint: &str, body: &Value, label: &str) -> Result<JsonMap, ApiError> {
-    let window = web_sys::window().ok_or_else(|| {
-        ApiError::new(
-            "浏览器环境不可用",
-            0,
-            "OPENAI_VALIDATION_ENVIRONMENT_INVALID",
-        )
-    })?;
+async fn post_json(
+    endpoint: &str,
+    body: &Value,
+    label: &str,
+    timeout_ms: i32,
+    fallback_code: &str,
+) -> Result<JsonMap, ApiError> {
+    let window = web_sys::window()
+        .ok_or_else(|| ApiError::new("浏览器环境不可用", 0, VALIDATION_ENVIRONMENT_INVALID))?;
     let controller = AbortController::new()
-        .map_err(|error| ApiError::new(js_error(error), 0, "OPENAI_VALIDATION_REQUEST_FAILED"))?;
+        .map_err(|error| ApiError::new(js_error(error), 0, VALIDATION_REQUEST_FAILED))?;
     let headers = Headers::new()
-        .map_err(|error| ApiError::new(js_error(error), 0, "OPENAI_VALIDATION_REQUEST_FAILED"))?;
+        .map_err(|error| ApiError::new(js_error(error), 0, VALIDATION_REQUEST_FAILED))?;
     headers
         .set("Content-Type", "application/json")
-        .map_err(|error| ApiError::new(js_error(error), 0, "OPENAI_VALIDATION_REQUEST_FAILED"))?;
+        .map_err(|error| ApiError::new(js_error(error), 0, VALIDATION_REQUEST_FAILED))?;
     let init = RequestInit::new();
     init.set_method("POST");
     init.set_headers_headers(&headers);
@@ -130,9 +136,9 @@ async fn post_json(endpoint: &str, body: &Value, label: &str) -> Result<JsonMap,
     let timeout_id = window
         .set_timeout_with_callback_and_timeout_and_arguments_0(
             timeout.as_ref().unchecked_ref(),
-            REQUEST_TIMEOUT_MS,
+            timeout_ms,
         )
-        .map_err(|error| ApiError::new(js_error(error), 0, "OPENAI_VALIDATION_REQUEST_FAILED"))?;
+        .map_err(|error| ApiError::new(js_error(error), 0, VALIDATION_REQUEST_FAILED))?;
 
     let fetched = JsFuture::from(window.fetch_with_str_and_init(endpoint, &init)).await;
     let response = match fetched {
@@ -144,7 +150,7 @@ async fn post_json(endpoint: &str, body: &Value, label: &str) -> Result<JsonMap,
                 return Err(ApiError::new(
                     js_error(error),
                     0,
-                    "OPENAI_VALIDATION_RESPONSE_INVALID",
+                    VALIDATION_RESPONSE_INVALID,
                 ));
             }
         },
@@ -155,7 +161,7 @@ async fn post_json(endpoint: &str, body: &Value, label: &str) -> Result<JsonMap,
                 Err(ApiError::new(
                     format!("{label} 联网验证超时，请稍后重试或检查服务器网络"),
                     0,
-                    "OPENAI_VALIDATION_TIMEOUT",
+                    VALIDATION_TIMEOUT,
                 ))
             } else {
                 Err(ApiError::new(
@@ -164,7 +170,7 @@ async fn post_json(endpoint: &str, body: &Value, label: &str) -> Result<JsonMap,
                         js_error(error)
                     ),
                     0,
-                    "OPENAI_VALIDATION_REQUEST_FAILED",
+                    VALIDATION_REQUEST_FAILED,
                 ))
             };
         }
@@ -182,14 +188,14 @@ async fn post_json(endpoint: &str, body: &Value, label: &str) -> Result<JsonMap,
             return Err(ApiError::new(
                 format!("{label} 联网验证超时，请稍后重试或检查服务器网络"),
                 0,
-                "OPENAI_VALIDATION_TIMEOUT",
+                VALIDATION_TIMEOUT,
             ));
         }
         Err(error) => {
             return Err(ApiError::new(
                 js_error(error),
                 status,
-                "OPENAI_VALIDATION_RESPONSE_INVALID",
+                VALIDATION_RESPONSE_INVALID,
             ));
         }
     };
@@ -211,13 +217,7 @@ async fn post_json(endpoint: &str, body: &Value, label: &str) -> Result<JsonMap,
     Err(ApiError::new(
         message.unwrap_or_else(|| http_error_message(label, status, Some(&text))),
         status,
-        code.unwrap_or_else(|| {
-            if label == "RT" {
-                "OPENAI_OAUTH_REQUEST_FAILED".to_owned()
-            } else {
-                "OPENAI_CODEX_PAT_VALIDATE_FAILED".to_owned()
-            }
-        }),
+        code.unwrap_or_else(|| fallback_code.to_owned()),
     ))
 }
 
@@ -232,6 +232,8 @@ async fn request_refresh_token(
             "client_id": client_id,
         }),
         "RT",
+        OPENAI_REQUEST_TIMEOUT_MS,
+        "OPENAI_OAUTH_REQUEST_FAILED",
     )
     .await?;
     if string_field(&fields, "access_token").is_none() {
@@ -247,16 +249,36 @@ async fn request_refresh_token(
     })
 }
 
-pub async fn refresh_token(refresh_token: &str) -> Result<OAuthTokenInfo, String> {
-    request_refresh_token(refresh_token, OPENAI_CODEX_CLIENT_ID)
-        .await
-        .map_err(format_api_error)
+fn should_try_mobile(error: &ApiError) -> bool {
+    matches!(error.status, 400 | 401)
+        && matches!(
+            error.code.to_ascii_lowercase().as_str(),
+            "invalid_grant" | "invalid_client" | "unauthorized_client"
+        )
 }
 
-pub async fn refresh_mobile_token(refresh_token: &str) -> Result<OAuthTokenInfo, String> {
-    request_refresh_token(refresh_token, OPENAI_MOBILE_CLIENT_ID)
-        .await
-        .map_err(format_api_error)
+async fn refresh_openai_token(refresh_token: &str) -> Result<OAuthTokenInfo, String> {
+    match request_refresh_token(refresh_token, OPENAI_CODEX_CLIENT_ID).await {
+        Ok(info) => Ok(info),
+        Err(error) if should_try_mobile(&error) => {
+            request_refresh_token(refresh_token, OPENAI_MOBILE_CLIENT_ID)
+                .await
+                .map_err(format_api_error)
+        }
+        Err(error) => Err(format_api_error(error)),
+    }
+}
+
+pub async fn refresh_token(
+    refresh_token: &str,
+) -> Result<(RefreshTokenKind, OAuthTokenInfo), String> {
+    let kind =
+        classify_refresh_token(refresh_token).ok_or_else(|| "无法识别 RT 格式".to_owned())?;
+    let info = match kind {
+        RefreshTokenKind::OpenAi => refresh_openai_token(refresh_token).await?,
+        RefreshTokenKind::Grok => refresh_grok_token(refresh_token).await?,
+    };
+    Ok((kind, info))
 }
 
 pub async fn validate_access_token(access_token: &str) -> Result<PersonalAccessTokenInfo, String> {
@@ -264,6 +286,8 @@ pub async fn validate_access_token(access_token: &str) -> Result<PersonalAccessT
         "/api/openai/whoami",
         &json!({ "access_token": access_token }),
         "AT",
+        OPENAI_REQUEST_TIMEOUT_MS,
+        "OPENAI_CODEX_PAT_VALIDATE_FAILED",
     )
     .await
     .map_err(format_api_error)?;
@@ -289,5 +313,43 @@ pub async fn validate_access_token(access_token: &str) -> Result<PersonalAccessT
         account_id: string_field(&values, "chatgpt_account_id").unwrap_or_default(),
         plan_type: string_field(&values, "chatgpt_plan_type").unwrap_or_default(),
         is_fedramp,
+    })
+}
+
+async fn refresh_grok_token(refresh_token: &str) -> Result<OAuthTokenInfo, String> {
+    let fields = post_json(
+        "/api/grok/refresh",
+        &json!({ "refresh_token": refresh_token }),
+        "Grok RT",
+        GROK_REQUEST_TIMEOUT_MS,
+        "GROK_OAUTH_REQUEST_FAILED",
+    )
+    .await
+    .map_err(format_api_error)?;
+    if string_field(&fields, "access_token").is_none() {
+        return Err("xAI OAuth 返回结果中缺少 access_token".to_owned());
+    }
+    Ok(OAuthTokenInfo {
+        client_id: string_field(&fields, "client_id").unwrap_or_default(),
+        fields,
+    })
+}
+
+pub async fn convert_grok_sso(sso_token: &str) -> Result<OAuthTokenInfo, String> {
+    let fields = post_json(
+        "/api/grok/sso",
+        &json!({ "sso_token": sso_token }),
+        "SSO",
+        GROK_SSO_REQUEST_TIMEOUT_MS,
+        "GROK_SSO_CONVERSION_FAILED",
+    )
+    .await
+    .map_err(format_api_error)?;
+    if string_field(&fields, "access_token").is_none() {
+        return Err("xAI Device Flow 返回结果中缺少 access_token".to_owned());
+    }
+    Ok(OAuthTokenInfo {
+        client_id: string_field(&fields, "client_id").unwrap_or_default(),
+        fields,
     })
 }

@@ -2,23 +2,30 @@ use serde_json::{Map, Value};
 
 pub type JsonMap = Map<String, Value>;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub enum OutputFormat {
     #[default]
     Sub2Api,
     Cpa,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub enum InputMode {
     #[default]
     Json,
     Rt,
-    MobileRt,
     At,
+    GrokSso,
+    AgentIdentity,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum RefreshTokenKind {
+    OpenAi,
+    Grok,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub enum SourceType {
     ChatGptWebSession,
     Cpa,
@@ -26,6 +33,9 @@ pub enum SourceType {
     ManualAt,
     ManualRt,
     ManualMobileRt,
+    ManualGrokRt,
+    ManualGrokSso,
+    AgentIdentity,
 }
 
 impl SourceType {
@@ -37,6 +47,9 @@ impl SourceType {
             Self::ManualAt => "AT",
             Self::ManualRt => "RT",
             Self::ManualMobileRt => "Mobile RT",
+            Self::ManualGrokRt => "Grok RT",
+            Self::ManualGrokSso => "SSO",
+            Self::AgentIdentity => "AI",
         }
     }
 
@@ -48,11 +61,14 @@ impl SourceType {
             Self::ManualAt => "manual_at",
             Self::ManualRt => "manual_rt",
             Self::ManualMobileRt => "manual_mobile_rt",
+            Self::ManualGrokRt => "manual_grok_rt",
+            Self::ManualGrokSso => "manual_grok_sso",
+            Self::AgentIdentity => "agent_identity",
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Sub2ApiSettings {
     pub name: Option<String>,
     pub platform: Option<String>,
@@ -71,7 +87,7 @@ pub struct Sub2ApiSettings {
     pub restored_from_bridge: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NormalizedAccount {
     pub source_name: String,
     pub source_path: String,
@@ -101,7 +117,7 @@ pub struct NormalizedAccount {
     pub sub2api_settings: Option<Sub2ApiSettings>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ParseIssue {
     pub source_name: String,
     pub source_path: Option<String>,
@@ -123,19 +139,16 @@ impl ParseIssue {
     }
 }
 
-#[derive(Clone, Debug, Default)]
 pub struct ParseResult {
     pub accounts: Vec<NormalizedAccount>,
     pub issues: Vec<ParseIssue>,
 }
 
-#[derive(Clone, Debug)]
 pub struct ArchiveEntry {
     pub file_name: String,
     pub text: String,
 }
 
-#[derive(Clone, Debug)]
 pub enum DownloadDescriptor {
     Json {
         file_name: String,
@@ -147,13 +160,11 @@ pub enum DownloadDescriptor {
     },
 }
 
-#[derive(Clone, Debug)]
 pub struct OAuthTokenInfo {
     pub fields: JsonMap,
     pub client_id: String,
 }
 
-#[derive(Clone, Debug)]
 pub struct PersonalAccessTokenInfo {
     pub email: String,
     pub user_id: String,

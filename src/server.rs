@@ -1,6 +1,5 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
-use async_trait::async_trait;
 use axum::{
     Json, Router,
     body::Body,
@@ -16,6 +15,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tower::limit::ConcurrencyLimitLayer;
 
+mod grok;
+
+use grok::{GrokError, ReqwestGrokGateway, normalize_sso_token};
+
 const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_PAT_WHOAMI_URL: &str =
     "https://auth.openai.com/api/accounts/v1/user-auth-credential/whoami";
@@ -28,6 +31,8 @@ const OPENAI_UNSUPPORTED_REGION_MESSAGE: &str =
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(13);
+const GROK_REFRESH_HANDLER_TIMEOUT: Duration = Duration::from_secs(15);
+const GROK_SSO_HANDLER_TIMEOUT: Duration = Duration::from_secs(92);
 const MAX_REQUEST_BYTES: usize = 24 * 1024;
 const MAX_UPSTREAM_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ACCESS_TOKEN_LENGTH: usize = 8 * 1024;
@@ -40,25 +45,27 @@ const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; conn
 struct WebAssets;
 
 #[derive(Clone)]
-pub struct AppState {
-    gateway: Arc<dyn OpenAiGateway>,
+struct AppState {
+    openai_gateway: ReqwestOpenAiGateway,
+    grok_gateway: ReqwestGrokGateway,
 }
 
 impl AppState {
-    pub fn new(gateway: ReqwestOpenAiGateway) -> Self {
-        Self {
-            gateway: Arc::new(gateway),
-        }
+    fn new() -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            openai_gateway: ReqwestOpenAiGateway::new()?,
+            grok_gateway: ReqwestGrokGateway::new()?,
+        })
     }
 }
 
 #[derive(Clone)]
-pub struct ReqwestOpenAiGateway {
+struct ReqwestOpenAiGateway {
     client: reqwest::Client,
 }
 
 impl ReqwestOpenAiGateway {
-    pub fn new() -> Result<Self, reqwest::Error> {
+    fn new() -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
@@ -104,21 +111,7 @@ impl ReqwestOpenAiGateway {
         }
         Ok(UpstreamResponse { status, body })
     }
-}
 
-#[async_trait]
-trait OpenAiGateway: Send + Sync {
-    async fn refresh(
-        &self,
-        refresh_token: &str,
-        client_id: &str,
-    ) -> Result<UpstreamResponse, GatewayError>;
-
-    async fn whoami(&self, access_token: &str) -> Result<UpstreamResponse, GatewayError>;
-}
-
-#[async_trait]
-impl OpenAiGateway for ReqwestOpenAiGateway {
     async fn refresh(
         &self,
         refresh_token: &str,
@@ -160,13 +153,11 @@ impl OpenAiGateway for ReqwestOpenAiGateway {
     }
 }
 
-#[derive(Clone)]
 struct UpstreamResponse {
     status: StatusCode,
     body: Vec<u8>,
 }
 
-#[derive(Clone)]
 struct GatewayError {
     code: &'static str,
     message: &'static str,
@@ -199,14 +190,25 @@ struct WhoamiRequest {
     access_token: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct GrokRefreshRequest {
+    refresh_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GrokSsoRequest {
+    sso_token: Option<String>,
+}
+
 #[derive(Clone, Copy)]
 enum TokenType {
     Access,
     Refresh,
 }
 
-pub fn build_app(state: AppState) -> Router {
-    let api = Router::new()
+pub fn build_app() -> Result<Router, reqwest::Error> {
+    let state = AppState::new()?;
+    let openai_api = Router::new()
         .route(
             "/refresh",
             post(refresh_handler).fallback(method_not_allowed),
@@ -214,14 +216,25 @@ pub fn build_app(state: AppState) -> Router {
         .route("/whoami", post(whoami_handler).fallback(method_not_allowed))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS));
-    let api = Router::new().nest("/openai", api).fallback(api_not_found);
+    let grok_api = Router::new()
+        .route(
+            "/refresh",
+            post(grok_refresh_handler).fallback(method_not_allowed),
+        )
+        .route("/sso", post(grok_sso_handler).fallback(method_not_allowed))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS));
+    let api = Router::new()
+        .nest("/openai", openai_api)
+        .nest("/grok", grok_api)
+        .fallback(api_not_found);
 
-    Router::new()
+    Ok(Router::new()
         .route("/api/", any(api_not_found))
         .nest("/api", api)
         .fallback(embedded_asset)
         .layer(middleware::from_fn(security_headers))
-        .with_state(state)
+        .with_state(state))
 }
 
 async fn embedded_asset(uri: Uri) -> Response {
@@ -306,6 +319,13 @@ async fn refresh_handler(
         .as_deref()
         .map(str::trim)
         .unwrap_or_default();
+    if looks_like_document(refresh_token) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "OPENAI_OAUTH_REFRESH_TOKEN_INVALID",
+            "检测到 HTML 或 JSON 内容，请提交 RT 本身",
+        );
+    }
     if let Some(message) = token_validation_error(refresh_token, TokenType::Refresh) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -328,7 +348,7 @@ async fn refresh_handler(
 
     let upstream = match tokio::time::timeout(
         HANDLER_TIMEOUT,
-        state.gateway.refresh(refresh_token, client_id),
+        state.openai_gateway.refresh(refresh_token, client_id),
     )
     .await
     {
@@ -376,17 +396,21 @@ async fn whoami_handler(
         );
     }
 
-    let upstream =
-        match tokio::time::timeout(HANDLER_TIMEOUT, state.gateway.whoami(access_token)).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => return gateway_error(error),
-            Err(_) => {
-                return gateway_error(GatewayError::new(
-                    "OPENAI_UPSTREAM_TIMEOUT",
-                    "连接 OpenAI 超时，请稍后重试",
-                ));
-            }
-        };
+    let upstream = match tokio::time::timeout(
+        HANDLER_TIMEOUT,
+        state.openai_gateway.whoami(access_token),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => return gateway_error(error),
+        Err(_) => {
+            return gateway_error(GatewayError::new(
+                "OPENAI_UPSTREAM_TIMEOUT",
+                "连接 OpenAI 超时，请稍后重试",
+            ));
+        }
+    };
     let Some(payload) = parse_json_object(&upstream.body) else {
         return api_error(
             StatusCode::BAD_GATEWAY,
@@ -452,6 +476,94 @@ async fn whoami_handler(
     )
 }
 
+async fn grok_refresh_handler(
+    State(state): State<AppState>,
+    request: Result<Json<GrokRefreshRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    let refresh_token = request
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    if looks_like_document(refresh_token) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "GROK_OAUTH_REFRESH_TOKEN_INVALID",
+            "检测到 HTML 或 JSON 内容，请提交 Grok RT 本身",
+        );
+    }
+    if let Some(message) = token_validation_error(refresh_token, TokenType::Refresh) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "GROK_OAUTH_REFRESH_TOKEN_INVALID",
+            message,
+        );
+    }
+    match tokio::time::timeout(
+        GROK_REFRESH_HANDLER_TIMEOUT,
+        state.grok_gateway.refresh(refresh_token),
+    )
+    .await
+    {
+        Ok(Ok(payload)) => api_json(StatusCode::OK, Value::Object(payload)),
+        Ok(Err(error)) => grok_error(error),
+        Err(_) => api_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "GROK_UPSTREAM_TIMEOUT",
+            "连接 xAI 超时，请稍后重试",
+        ),
+    }
+}
+
+async fn grok_sso_handler(
+    State(state): State<AppState>,
+    request: Result<Json<GrokSsoRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    let raw = request.sso_token.as_deref().unwrap_or_default();
+    if looks_like_document(raw) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "GROK_SSO_INVALID",
+            "检测到 HTML 或 JSON 内容，请提交 SSO 本身",
+        );
+    }
+    if raw.len() > MAX_REFRESH_TOKEN_LENGTH {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "GROK_SSO_INVALID",
+            "SSO 长度超过限制",
+        );
+    }
+    let sso_token = normalize_sso_token(raw);
+    if sso_token.is_empty()
+        || sso_token.len() > MAX_REFRESH_TOKEN_LENGTH
+        || !sso_token.chars().all(is_token_character)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "GROK_SSO_INVALID",
+            "SSO 格式无效；每次只能提交一个完整凭证",
+        );
+    }
+    match tokio::time::timeout(GROK_SSO_HANDLER_TIMEOUT, state.grok_gateway.sso(&sso_token)).await {
+        Ok(Ok(payload)) => api_json(StatusCode::OK, Value::Object(payload)),
+        Ok(Err(error)) => grok_error(error),
+        Err(_) => api_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "GROK_SSO_TIMEOUT",
+            "SSO 转换超时，请重试",
+        ),
+    }
+}
+
 fn json_rejection(rejection: JsonRejection) -> Response {
     if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
         return api_error(
@@ -465,6 +577,10 @@ fn json_rejection(rejection: JsonRejection) -> Response {
 
 fn gateway_error(error: GatewayError) -> Response {
     api_error(StatusCode::BAD_GATEWAY, error.code, error.message)
+}
+
+fn grok_error(error: GrokError) -> Response {
+    api_error(error.status, error.code, &error.message)
 }
 
 fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
@@ -531,6 +647,14 @@ fn token_validation_error(token: &str, token_type: TokenType) -> Option<&'static
 
 fn is_token_character(value: char) -> bool {
     !value.is_whitespace() && !value.is_control()
+}
+
+fn looks_like_document(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.starts_with("<!doctype html")
+        || value.starts_with("<html")
+        || value.starts_with('{')
+        || value.starts_with('[')
 }
 
 fn parse_json_object(body: &[u8]) -> Option<Map<String, Value>> {

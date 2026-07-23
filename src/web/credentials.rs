@@ -1,25 +1,36 @@
 use std::collections::{BTreeSet, HashSet};
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use js_sys::Date;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use super::model::{
     ArchiveEntry, DownloadDescriptor, InputMode, JsonMap, NormalizedAccount, OAuthTokenInfo,
-    OutputFormat, ParseIssue, ParseResult, PersonalAccessTokenInfo, SourceType, Sub2ApiSettings,
+    OutputFormat, ParseIssue, ParseResult, PersonalAccessTokenInfo, RefreshTokenKind, SourceType,
+    Sub2ApiSettings,
 };
 
 pub const OPENAI_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 pub const OPENAI_PROFILE_CLAIM: &str = "https://api.openai.com/profile";
 pub const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const OPENAI_MOBILE_CLIENT_ID: &str = "app_LlGpXReQgckcGGUo2JrYvtJK";
+pub const GROK_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+
+const GROK_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
+const GROK_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
+const GROK_TOKEN_ENDPOINT: &str = "https://auth.x.ai/oauth2/token";
 
 const SESSION_BRIDGE_KEY: &str = "session_bridge";
 const SESSION_BRIDGE_SCHEMA: i64 = 1;
 const MAX_CPA_FILE_TOKEN_BYTES: usize = 240;
 const MAX_ACCESS_TOKEN_LENGTH: usize = 8 * 1024;
 const MAX_REFRESH_TOKEN_LENGTH: usize = 16 * 1024;
+const OPENAI_AGENT_IDENTITY_AUTH_MODE: &str = "agentIdentity";
+const CPA_AGENT_IDENTITY_TYPE: &str = "codex-agent-identity";
 const OPENAI_PAT_AUTH_MODE: &str = "personalAccessToken";
 const OPENAI_PAT_LEGACY_AUTH_MODE: &str = "personal_access_token";
 
@@ -74,7 +85,6 @@ const CREDENTIAL_FIELD_NAMES: &[&str] = &[
     "sessionToken",
 ];
 
-#[derive(Clone)]
 struct CredentialCandidate {
     value: JsonMap,
     source_name: String,
@@ -82,6 +92,17 @@ struct CredentialCandidate {
     source_type: SourceType,
     exported_at: Option<String>,
     sub2api_settings: Option<Sub2ApiSettings>,
+}
+
+struct AgentIdentityData {
+    runtime_id: String,
+    private_key: String,
+    task_id: Option<String>,
+    account_id: String,
+    user_id: String,
+    email: Option<String>,
+    plan_type: Option<String>,
+    is_fedramp: bool,
 }
 
 fn non_empty(value: &Value) -> Option<String> {
@@ -115,6 +136,202 @@ fn read_string(record: &JsonMap, path: &str) -> Option<String> {
 
 fn read_first_string(record: &JsonMap, paths: &[&str]) -> Option<String> {
     first_non_empty(paths.iter().map(|path| read_string(record, path)))
+}
+
+fn read_alias_string(record: &JsonMap, snake_case: &str, camel_case: &str) -> Option<String> {
+    first_non_empty([
+        record.get(snake_case).and_then(non_empty),
+        record.get(camel_case).and_then(non_empty),
+    ])
+}
+
+fn nested_object<'a>(
+    record: &'a JsonMap,
+    snake_case: &str,
+    camel_case: &str,
+) -> Option<&'a JsonMap> {
+    record
+        .get(snake_case)
+        .or_else(|| record.get(camel_case))
+        .and_then(Value::as_object)
+}
+
+fn agent_identity_source(record: &JsonMap) -> Option<&JsonMap> {
+    let credentials = record.get("credentials").and_then(Value::as_object);
+    for container in [Some(record), credentials].into_iter().flatten() {
+        if let Some(identity) = nested_object(container, "agent_identity", "agentIdentity") {
+            return Some(identity);
+        }
+    }
+    for container in [Some(record), credentials].into_iter().flatten() {
+        let auth_mode = read_alias_string(container, "auth_mode", "authMode");
+        if auth_mode.is_some_and(|mode| mode.eq_ignore_ascii_case(OPENAI_AGENT_IDENTITY_AUTH_MODE))
+        {
+            return Some(container);
+        }
+    }
+    [Some(record), credentials]
+        .into_iter()
+        .flatten()
+        .find(|container| {
+            [
+                "agent_runtime_id",
+                "agentRuntimeId",
+                "agent_private_key",
+                "agentPrivateKey",
+            ]
+            .iter()
+            .any(|key| container.contains_key(*key))
+        })
+}
+
+fn read_der_item<'a>(input: &'a [u8], offset: &mut usize) -> Option<(u8, &'a [u8])> {
+    let tag = *input.get(*offset)?;
+    *offset += 1;
+    let first_length = *input.get(*offset)?;
+    *offset += 1;
+    let length = if first_length & 0x80 == 0 {
+        usize::from(first_length)
+    } else {
+        let byte_count = usize::from(first_length & 0x7f);
+        if byte_count == 0 || byte_count > std::mem::size_of::<usize>() {
+            return None;
+        }
+        let length_bytes = input.get(*offset..offset.checked_add(byte_count)?)?;
+        if length_bytes.first() == Some(&0) {
+            return None;
+        }
+        *offset += byte_count;
+        length_bytes.iter().try_fold(0_usize, |length, byte| {
+            length.checked_mul(256)?.checked_add(usize::from(*byte))
+        })?
+    };
+    let end = offset.checked_add(length)?;
+    let value = input.get(*offset..end)?;
+    *offset = end;
+    Some((tag, value))
+}
+
+fn valid_agent_identity_private_key(encoded: &str) -> bool {
+    let Ok(der) = STANDARD.decode(encoded) else {
+        return false;
+    };
+    let mut outer_offset = 0;
+    let Some((0x30, outer)) = read_der_item(&der, &mut outer_offset) else {
+        return false;
+    };
+    if outer_offset != der.len() {
+        return false;
+    }
+
+    let mut offset = 0;
+    let Some((0x02, version)) = read_der_item(outer, &mut offset) else {
+        return false;
+    };
+    if version != [0] {
+        return false;
+    }
+    let Some((0x30, algorithm)) = read_der_item(outer, &mut offset) else {
+        return false;
+    };
+    let mut algorithm_offset = 0;
+    let Some((0x06, oid)) = read_der_item(algorithm, &mut algorithm_offset) else {
+        return false;
+    };
+    if oid != [0x2b, 0x65, 0x70] || algorithm_offset != algorithm.len() {
+        return false;
+    }
+    let Some((0x04, private_key)) = read_der_item(outer, &mut offset) else {
+        return false;
+    };
+    if offset != outer.len() {
+        return false;
+    }
+    let mut private_key_offset = 0;
+    let Some((0x04, seed)) = read_der_item(private_key, &mut private_key_offset) else {
+        return false;
+    };
+    seed.len() == 32 && private_key_offset == private_key.len()
+}
+
+fn parse_agent_identity(record: &JsonMap) -> Result<AgentIdentityData, String> {
+    let identity =
+        agent_identity_source(record).ok_or_else(|| "未找到 Agent Identity 凭证".to_owned())?;
+    let runtime_id = read_alias_string(identity, "agent_runtime_id", "agentRuntimeId");
+    let private_key = read_alias_string(identity, "agent_private_key", "agentPrivateKey");
+    let account_id = read_alias_string(identity, "account_id", "accountId")
+        .or_else(|| read_alias_string(identity, "chatgpt_account_id", "chatgptAccountId"));
+    let user_id = read_alias_string(identity, "chatgpt_user_id", "chatgptUserId")
+        .or_else(|| read_alias_string(identity, "chatgpt_account_user_id", "chatgptAccountUserId"));
+    let missing = [
+        ("agent_runtime_id", runtime_id.is_none()),
+        ("agent_private_key", private_key.is_none()),
+        ("account_id", account_id.is_none()),
+        ("chatgpt_user_id", user_id.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(field, missing)| missing.then_some(field))
+    .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Agent Identity 缺少必要字段：{}",
+            missing.join("、")
+        ));
+    }
+    let private_key = private_key.unwrap_or_default();
+    if !valid_agent_identity_private_key(&private_key) {
+        return Err("agent_private_key 必须是 Base64 编码的 PKCS#8 Ed25519 私钥".to_owned());
+    }
+    Ok(AgentIdentityData {
+        runtime_id: runtime_id.unwrap_or_default(),
+        private_key,
+        task_id: read_alias_string(identity, "task_id", "taskId"),
+        account_id: account_id.unwrap_or_default(),
+        user_id: user_id.unwrap_or_default(),
+        email: first_non_empty([
+            identity.get("email").and_then(non_empty),
+            identity.get("outlook_email").and_then(non_empty),
+        ]),
+        plan_type: read_alias_string(identity, "plan_type", "planType"),
+        is_fedramp: identity
+            .get("chatgpt_account_is_fedramp")
+            .or_else(|| identity.get("chatgptAccountIsFedramp"))
+            .and_then(bool_value)
+            .unwrap_or(false),
+    })
+}
+
+fn agent_identity_credentials(identity: &AgentIdentityData) -> JsonMap {
+    let mut credentials = Map::from_iter([
+        (
+            "auth_mode".to_owned(),
+            json!(OPENAI_AGENT_IDENTITY_AUTH_MODE),
+        ),
+        ("agent_runtime_id".to_owned(), json!(identity.runtime_id)),
+        ("agent_private_key".to_owned(), json!(identity.private_key)),
+        ("chatgpt_account_id".to_owned(), json!(identity.account_id)),
+        ("chatgpt_user_id".to_owned(), json!(identity.user_id)),
+        (
+            "chatgpt_account_is_fedramp".to_owned(),
+            json!(identity.is_fedramp),
+        ),
+    ]);
+    insert_optional(
+        &mut credentials,
+        "task_id",
+        identity.task_id.clone().map(Value::String),
+    );
+    insert_optional(
+        &mut credentials,
+        "email",
+        identity.email.clone().map(Value::String),
+    );
+    insert_optional(
+        &mut credentials,
+        "plan_type",
+        identity.plan_type.clone().map(Value::String),
+    );
+    credentials
 }
 
 fn number(value: &Value) -> Option<f64> {
@@ -294,7 +511,10 @@ fn without_credential_fields(record: &JsonMap) -> JsonMap {
 }
 
 fn is_likely_cpa(record: &JsonMap) -> bool {
-    record.get("type").and_then(Value::as_str) == Some("codex")
+    record
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind.to_ascii_lowercase().as_str(), "codex" | "xai" | "grok"))
         || (record.get("access_token").is_some_and(Value::is_string)
             && [
                 "account_id",
@@ -304,6 +524,10 @@ fn is_likely_cpa(record: &JsonMap) -> bool {
             ]
             .iter()
             .any(|key| record.contains_key(*key)))
+}
+
+fn is_likely_agent_identity(record: &JsonMap) -> bool {
+    agent_identity_source(record).is_some()
 }
 
 fn is_likely_sub2api_account(record: &JsonMap) -> bool {
@@ -413,6 +637,10 @@ fn build_sub2api_normalization_record(record: &JsonMap, exported_at: Option<&str
     let settings = build_sub2api_settings(record, None, false, None);
     let credentials = &settings.credentials;
     let extra = &settings.extra;
+    let grok = settings
+        .platform
+        .as_deref()
+        .is_some_and(|platform| platform.eq_ignore_ascii_case("grok"));
     let mut normalized = extra.clone();
     normalized.extend(credentials.clone());
     let pairs: [(&str, Option<String>); 8] = [
@@ -459,7 +687,7 @@ fn build_sub2api_normalization_record(record: &JsonMap, exported_at: Option<&str
             "auth_provider",
             first_non_empty([
                 extra.get("auth_provider").and_then(non_empty),
-                Some("openai".to_owned()),
+                Some(if grok { "xai" } else { "openai" }.to_owned()),
             ]),
         ),
         (
@@ -468,7 +696,10 @@ fn build_sub2api_normalization_record(record: &JsonMap, exported_at: Option<&str
         ),
         (
             "user_id",
-            credentials.get("chatgpt_user_id").and_then(non_empty),
+            first_non_empty([
+                credentials.get("chatgpt_user_id").and_then(non_empty),
+                credentials.get("sub").and_then(non_empty),
+            ]),
         ),
     ];
     for (key, value) in pairs {
@@ -541,6 +772,11 @@ fn collect_candidates(value: &Value, source_name: &str) -> Vec<CredentialCandida
                 for (index, account) in accounts.iter().enumerate() {
                     let source_path = format!("{path}.accounts[{index}]");
                     if let Some(account) = account.as_object() {
+                        let source_type = if is_likely_agent_identity(account) {
+                            SourceType::AgentIdentity
+                        } else {
+                            SourceType::Sub2Api
+                        };
                         found.push(CredentialCandidate {
                             value: build_sub2api_normalization_record(
                                 account,
@@ -548,7 +784,7 @@ fn collect_candidates(value: &Value, source_name: &str) -> Vec<CredentialCandida
                             ),
                             source_name: source_name.to_owned(),
                             source_path,
-                            source_type: SourceType::Sub2Api,
+                            source_type,
                             exported_at: exported_at.clone(),
                             sub2api_settings: Some(build_sub2api_settings(
                                 account,
@@ -569,6 +805,23 @@ fn collect_candidates(value: &Value, source_name: &str) -> Vec<CredentialCandida
                     }
                 }
             }
+            return;
+        }
+        if is_likely_agent_identity(record) {
+            let sub2api_settings = is_likely_sub2api_account(record)
+                .then(|| build_sub2api_settings(record, None, false, None));
+            let value = sub2api_settings.as_ref().map_or_else(
+                || record.clone(),
+                |_| build_sub2api_normalization_record(record, None),
+            );
+            found.push(CredentialCandidate {
+                value,
+                source_name: source_name.to_owned(),
+                source_path: path.to_owned(),
+                source_type: SourceType::AgentIdentity,
+                exported_at: None,
+                sub2api_settings,
+            });
             return;
         }
         if is_likely_sub2api_account(record) {
@@ -756,14 +1009,18 @@ fn normalize_record(
             | SourceType::ManualAt
             | SourceType::ManualRt
             | SourceType::ManualMobileRt
+            | SourceType::ManualGrokRt
+            | SourceType::ManualGrokSso
     );
     if uses_settings
         && sub2api_settings
             .as_ref()
             .and_then(|settings| settings.platform.as_deref())
-            .is_some_and(|platform| !platform.eq_ignore_ascii_case("openai"))
+            .is_some_and(|platform| {
+                !platform.eq_ignore_ascii_case("openai") && !platform.eq_ignore_ascii_case("grok")
+            })
     {
-        return Err("仅支持转换 Sub2API 中 platform=openai 的账号".to_owned());
+        return Err("仅支持转换 Sub2API 中 platform=openai 或 grok 的账号".to_owned());
     }
     if uses_settings
         && sub2api_settings
@@ -774,11 +1031,31 @@ fn normalize_record(
         return Err("仅支持转换 Sub2API 中 type=oauth 的账号".to_owned());
     }
 
+    let is_grok = matches!(
+        source_type,
+        SourceType::ManualGrokRt | SourceType::ManualGrokSso
+    ) || sub2api_settings
+        .as_ref()
+        .and_then(|settings| settings.platform.as_deref())
+        .is_some_and(|platform| platform.eq_ignore_ascii_case("grok"))
+        || read_string(record, "type")
+            .is_some_and(|kind| matches!(kind.to_ascii_lowercase().as_str(), "xai" | "grok"))
+        || read_string(record, "auth_provider").is_some_and(|provider| {
+            matches!(provider.to_ascii_lowercase().as_str(), "xai" | "grok")
+        })
+        || read_string(record, "token_endpoint")
+            .is_some_and(|endpoint| endpoint.contains("auth.x.ai"))
+        || read_string(record, "base_url").is_some_and(|url| url.contains("grok.com"));
     let access_token = read_first_string(record, ACCESS_TOKEN_PATHS).unwrap_or_default();
     let refresh_token = read_first_string(record, REFRESH_TOKEN_PATHS);
     let supports_refresh_only = matches!(
         source_type,
-        SourceType::Sub2Api | SourceType::Cpa | SourceType::ManualRt | SourceType::ManualMobileRt
+        SourceType::Sub2Api
+            | SourceType::Cpa
+            | SourceType::ManualRt
+            | SourceType::ManualMobileRt
+            | SourceType::ManualGrokRt
+            | SourceType::ManualGrokSso
     );
     if access_token.is_empty() && !(supports_refresh_only && refresh_token.is_some()) {
         return Err("缺少 access_token / accessToken 或 refresh_token".to_owned());
@@ -807,7 +1084,7 @@ fn normalize_record(
     let prefers_jwt = matches!(
         source_type,
         SourceType::ChatGptWebSession | SourceType::ManualAt
-    );
+    ) && !is_grok;
     let token_expires_at = if prefers_jwt {
         first_non_empty([jwt_expires_at.clone(), declared_expires_at.clone()])
     } else {
@@ -867,6 +1144,16 @@ fn normalize_record(
         read_string(record, "chatgptUserId"),
         read_string(record, "providerSpecificData.chatgpt_user_id"),
         read_string(record, "providerSpecificData.chatgptUserId"),
+        read_string(record, "sub"),
+        read_string(record, "credentials.sub"),
+        id_payload
+            .as_ref()
+            .and_then(|payload| payload.get("sub"))
+            .and_then(non_empty),
+        access_payload
+            .as_ref()
+            .and_then(|payload| payload.get("sub"))
+            .and_then(non_empty),
         access_auth.get("chatgpt_user_id").and_then(non_empty),
         access_auth.get("user_id").and_then(non_empty),
         id_auth.get("chatgpt_user_id").and_then(non_empty),
@@ -880,6 +1167,8 @@ fn normalize_record(
         read_string(record, "providerSpecificData.chatgptPlanType"),
         read_string(record, "providerSpecificData.chatgpt_plan_type"),
         read_string(record, "credentials.plan_type"),
+        read_string(record, "subscription_tier"),
+        read_string(record, "credentials.subscription_tier"),
         access_auth.get("chatgpt_plan_type").and_then(non_empty),
         id_auth.get("chatgpt_plan_type").and_then(non_empty),
     ]);
@@ -900,7 +1189,14 @@ fn normalize_record(
             read_string(record, "label"),
             source_base.map(ToOwned::to_owned),
             account_id.clone(),
-            Some("ChatGPT Account".to_owned()),
+            Some(
+                if is_grok {
+                    "Grok Account"
+                } else {
+                    "ChatGPT Account"
+                }
+                .to_owned(),
+            ),
         ])
     } else {
         first_non_empty([
@@ -909,10 +1205,24 @@ fn normalize_record(
             read_string(record, "label"),
             source_base.map(ToOwned::to_owned),
             account_id.clone(),
-            Some("ChatGPT Account".to_owned()),
+            Some(
+                if is_grok {
+                    "Grok Account"
+                } else {
+                    "ChatGPT Account"
+                }
+                .to_owned(),
+            ),
         ])
     }
-    .unwrap_or_else(|| "ChatGPT Account".to_owned());
+    .unwrap_or_else(|| {
+        if is_grok {
+            "Grok Account"
+        } else {
+            "ChatGPT Account"
+        }
+        .to_owned()
+    });
     let exported_at = now_iso(now_ms);
     let last_refresh = first_non_empty([
         normalize_timestamp(record.get("last_refresh")),
@@ -922,20 +1232,18 @@ fn normalize_record(
         Some(exported_at.clone()),
     ])
     .unwrap_or(exported_at);
-    let synthetic_id_token = input_id_token
-        .as_ref()
-        .is_none()
-        .then(|| {
-            build_synthetic_id_token(
-                account_id.as_deref(),
-                email.as_deref(),
-                plan_type.as_deref(),
-                user_id.as_deref(),
-                token_expires_at.as_deref(),
-                now_ms,
-            )
-        })
-        .flatten();
+    let synthetic_id_token = if is_grok || input_id_token.is_some() {
+        None
+    } else {
+        build_synthetic_id_token(
+            account_id.as_deref(),
+            email.as_deref(),
+            plan_type.as_deref(),
+            user_id.as_deref(),
+            token_expires_at.as_deref(),
+            now_ms,
+        )
+    };
     let input_id_token_synthetic = record
         .get("id_token_synthetic")
         .and_then(bool_value)
@@ -954,8 +1262,10 @@ fn normalize_record(
     } else if input_id_token_synthetic {
         warnings.push("输入中的 id_token 已标记为合成 JWT，不是真实 OAuth id token。".to_owned());
     }
-    if account_id.is_none() {
+    if !is_grok && account_id.is_none() {
         warnings.push("未解析到 account_id，目标系统可能无法完整识别账号。".to_owned());
+    } else if is_grok && user_id.is_none() {
+        warnings.push("未解析到 Grok sub，目标系统可能无法完整识别账号。".to_owned());
     }
     if email.is_none() {
         warnings.push("未解析到邮箱，已使用来源名称作为账号名。".to_owned());
@@ -978,9 +1288,9 @@ fn normalize_record(
         auth_provider: first_non_empty([
             read_string(record, "authProvider"),
             read_string(record, "auth_provider"),
-            Some("openai".to_owned()),
+            Some(if is_grok { "xai" } else { "openai" }.to_owned()),
         ])
-        .unwrap_or_else(|| "openai".to_owned()),
+        .unwrap_or_else(|| if is_grok { "xai" } else { "openai" }.to_owned()),
         access_token,
         session_token,
         refresh_token: refresh_token.clone(),
@@ -1006,7 +1316,175 @@ fn normalize_record(
     })
 }
 
+fn normalize_agent_identity_record(
+    record: &JsonMap,
+    options: NormalizeOptions<'_>,
+) -> Result<NormalizedAccount, String> {
+    let NormalizeOptions {
+        source_name,
+        source_path,
+        sub2api_settings,
+        now_ms,
+        ..
+    } = options;
+    let identity = parse_agent_identity(record)?;
+    let email = identity
+        .email
+        .clone()
+        .or_else(|| read_string(record, "email"));
+    let plan_type = identity
+        .plan_type
+        .clone()
+        .or_else(|| read_string(record, "plan_type"));
+    let name = sub2api_settings
+        .as_ref()
+        .and_then(|settings| settings.name.clone())
+        .or_else(|| read_string(record, "name"))
+        .or_else(|| email.clone())
+        .unwrap_or_else(|| identity.account_id.clone());
+
+    let mut credentials = agent_identity_credentials(&identity);
+    if let Some(existing) = sub2api_settings
+        .as_ref()
+        .map(|settings| &settings.credentials)
+    {
+        // Keep non-OAuth extensions from a Sub2API account while replacing all
+        // identity fields with their canonical spelling and values.
+        for (key, value) in existing {
+            if !matches!(
+                key.as_str(),
+                "access_token"
+                    | "accessToken"
+                    | "refresh_token"
+                    | "refreshToken"
+                    | "session_token"
+                    | "sessionToken"
+                    | "id_token"
+                    | "idToken"
+                    | "expires_at"
+                    | "expiresAt"
+                    | "expires_in"
+                    | "expiresIn"
+                    | "auth_mode"
+                    | "authMode"
+                    | "agent_runtime_id"
+                    | "agentRuntimeId"
+                    | "agent_private_key"
+                    | "agentPrivateKey"
+                    | "task_id"
+                    | "taskId"
+                    | "account_id"
+                    | "accountId"
+                    | "chatgpt_account_id"
+                    | "chatgptAccountId"
+                    | "chatgpt_user_id"
+                    | "chatgptUserId"
+                    | "email"
+                    | "plan_type"
+                    | "planType"
+                    | "chatgpt_account_is_fedramp"
+                    | "chatgptAccountIsFedramp"
+            ) {
+                credentials
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+    }
+    let imported_sub2api = sub2api_settings.is_some();
+    let mut extra = sub2api_settings
+        .as_ref()
+        .map(|settings| settings.extra.clone())
+        .unwrap_or_default();
+    if !imported_sub2api {
+        extra.insert("import_source".to_owned(), json!("codex_session"));
+        extra.insert("imported_at".to_owned(), json!(now_iso(now_ms)));
+    }
+
+    let mut settings = sub2api_settings.unwrap_or_else(|| {
+        manual_settings(
+            "openai",
+            credentials.clone(),
+            extra.clone(),
+            10.0,
+            1.0,
+            None,
+        )
+    });
+    settings.platform = Some("openai".to_owned());
+    settings.account_type = Some("oauth".to_owned());
+    settings.credentials = credentials;
+    settings.extra = extra;
+    settings.original_credential_keys = settings.credentials.keys().cloned().collect();
+    settings.expires_at = None;
+    settings.auto_pause_on_expired = None;
+    settings.name = Some(name.clone());
+    if !imported_sub2api {
+        for key in [
+            "priority",
+            "note",
+            "prefix",
+            "proxy_url",
+            "websockets",
+            "headers",
+        ] {
+            if let Some(value) = record.get(key) {
+                settings
+                    .account_fields
+                    .insert(key.to_owned(), value.clone());
+            }
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if identity.task_id.is_none() {
+        warnings.push("未包含 task_id，首次请求会由 Sub2API 注册新 task。".to_owned());
+    }
+    let last_refresh =
+        normalize_timestamp(record.get("last_refresh")).unwrap_or_else(|| now_iso(now_ms));
+    let source_path = source_path.to_owned();
+    Ok(NormalizedAccount {
+        source_name: source_name.to_owned(),
+        source_path,
+        source_type: SourceType::AgentIdentity,
+        name,
+        email,
+        account_id: Some(identity.account_id),
+        user_id: Some(identity.user_id),
+        plan_type,
+        organization_id: None,
+        auth_provider: "openai".to_owned(),
+        access_token: String::new(),
+        session_token: None,
+        refresh_token: None,
+        input_id_token: None,
+        id_token: None,
+        id_token_synthetic: false,
+        token_expires_at: None,
+        access_token_expires_at: None,
+        export_expires_at: None,
+        last_refresh,
+        disabled: record
+            .get("disabled")
+            .and_then(bool_value)
+            .or(settings.disabled)
+            .unwrap_or(false),
+        is_refreshable: false,
+        is_expired: false,
+        warnings,
+        preserved_cpa_fields: None,
+        sub2api_settings: Some(settings),
+    })
+}
+
 pub fn credential_keys(account: &NormalizedAccount) -> Vec<String> {
+    if account.source_type == SourceType::AgentIdentity {
+        return vec![format!(
+            "ai:{}:{}",
+            account.account_id.as_deref().unwrap_or("unknown"),
+            account.user_id.as_deref().unwrap_or("unknown")
+        )];
+    }
     let mut keys = Vec::new();
     if !account.access_token.is_empty() {
         keys.push(format!("at:{}", account.access_token));
@@ -1037,7 +1515,7 @@ pub fn parse_credential_text(text: &str, source_name: &str, now_ms: f64) -> Pars
         if candidates.is_empty() {
             issues.push(ParseIssue::new(
                 label,
-                "未找到可识别的 Session、CPA 或 Sub2API 账号",
+                "未找到可识别的 Session、CPA、Sub2API、Agent Identity 或 Grok 账号",
             ));
             continue;
         }
@@ -1064,18 +1542,21 @@ pub fn parse_credential_text(text: &str, source_name: &str, now_ms: f64) -> Pars
             } else {
                 None
             };
-            match normalize_record(
-                &candidate.value,
-                NormalizeOptions {
-                    source_name: &candidate.source_name,
-                    source_path: &candidate.source_path,
-                    source_type: candidate.source_type,
-                    last_refresh_fallback: candidate.exported_at.as_deref(),
-                    preserved_cpa_fields: preserved,
-                    sub2api_settings: candidate.sub2api_settings,
-                    now_ms,
-                },
-            ) {
+            let options = NormalizeOptions {
+                source_name: &candidate.source_name,
+                source_path: &candidate.source_path,
+                source_type: candidate.source_type,
+                last_refresh_fallback: candidate.exported_at.as_deref(),
+                preserved_cpa_fields: preserved,
+                sub2api_settings: candidate.sub2api_settings,
+                now_ms,
+            };
+            let normalized = if candidate.source_type == SourceType::AgentIdentity {
+                normalize_agent_identity_record(&candidate.value, options)
+            } else {
+                normalize_record(&candidate.value, options)
+            };
+            match normalized {
                 Ok(account) => {
                     let keys = credential_keys(&account);
                     if keys.iter().any(|key| seen.contains(key)) {
@@ -1112,11 +1593,68 @@ fn detect_non_token_document(text: &str) -> Option<&'static str> {
     None
 }
 
+fn normalize_grok_sso_token(value: &str) -> String {
+    let mut value = value.trim();
+    if value
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cookie:"))
+    {
+        value = value.get(7..).unwrap_or_default().trim();
+    }
+    for part in value.split(';') {
+        let Some((name, token)) = part.trim().split_once('=') else {
+            continue;
+        };
+        if matches!(name.trim().to_ascii_lowercase().as_str(), "sso" | "sso-rw") {
+            return token
+                .trim()
+                .chars()
+                .filter(|character| !matches!(character, '\r' | '\n' | '\0'))
+                .collect();
+        }
+    }
+    value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n' | '\0'))
+        .collect()
+}
+
+pub fn classify_refresh_token(token: &str) -> Option<RefreshTokenKind> {
+    let token = token.trim();
+    let url_safe = token
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if !url_safe {
+        return None;
+    }
+    if token.len() >= 32
+        && (token.starts_with("rt.") || token.starts_with("rt_") || token.starts_with("v1.MRRT."))
+    {
+        return Some(RefreshTokenKind::OpenAi);
+    }
+    if (48..=512).contains(&token.len()) && !token.contains('.') {
+        return Some(RefreshTokenKind::Grok);
+    }
+    None
+}
+
 fn manual_token_error(token: &str, mode: InputMode) -> Option<&'static str> {
+    if token.is_empty() {
+        return Some(match mode {
+            InputMode::GrokSso => "未找到有效的 SSO",
+            _ => "Token 不能为空",
+        });
+    }
     let max_length = match mode {
         InputMode::At => MAX_ACCESS_TOKEN_LENGTH,
-        InputMode::Rt | InputMode::MobileRt => MAX_REFRESH_TOKEN_LENGTH,
-        InputMode::Json => return Some("请选择 RT、Mobile RT 或 AT 输入"),
+        InputMode::Rt | InputMode::GrokSso => MAX_REFRESH_TOKEN_LENGTH,
+        InputMode::Json | InputMode::AgentIdentity => {
+            return Some("请选择一种 token 输入模式");
+        }
     };
     if mode == InputMode::At && !token.starts_with("at-") {
         return Some("AT 仅支持 at- 开头的 Personal Access Token");
@@ -1124,9 +1662,9 @@ fn manual_token_error(token: &str, mode: InputMode) -> Option<&'static str> {
     if token.len() > max_length {
         return Some(match mode {
             InputMode::At => "AT 长度超过限制",
-            InputMode::MobileRt => "Mobile RT 长度超过限制",
             InputMode::Rt => "RT 长度超过限制",
-            InputMode::Json => "Token 长度超过限制",
+            InputMode::GrokSso => "SSO 长度超过限制",
+            InputMode::Json | InputMode::AgentIdentity => "Token 长度超过限制",
         });
     }
     if !token
@@ -1135,18 +1673,22 @@ fn manual_token_error(token: &str, mode: InputMode) -> Option<&'static str> {
     {
         return Some(match mode {
             InputMode::At => "AT 含有空白或控制字符；每行只能填写一个完整 token",
-            InputMode::MobileRt => "Mobile RT 含有空白或控制字符；每行只能填写一个完整 token",
             InputMode::Rt => "RT 含有空白或控制字符；每行只能填写一个完整 token",
-            InputMode::Json => "Token 含有空白或控制字符",
+            InputMode::GrokSso => "SSO 格式无效；每行只能填写一个完整凭证",
+            InputMode::Json | InputMode::AgentIdentity => "Token 含有空白或控制字符",
         });
     }
-    if matches!(mode, InputMode::Rt | InputMode::MobileRt) && token.starts_with("at-") {
+    if mode == InputMode::Rt && token.starts_with("at-") {
         return Some("检测到 AT，请切换到 AT 输入");
+    }
+    if mode == InputMode::Rt && classify_refresh_token(token).is_none() {
+        return Some("无法识别 RT 格式；请检查是否混入了全角符号、排版破折号或不完整 token");
     }
     None
 }
 
 fn manual_settings(
+    platform: &str,
     credentials: JsonMap,
     extra: JsonMap,
     concurrency: f64,
@@ -1154,7 +1696,7 @@ fn manual_settings(
     auto_pause: Option<bool>,
 ) -> Sub2ApiSettings {
     Sub2ApiSettings {
-        platform: Some("openai".to_owned()),
+        platform: Some(platform.to_owned()),
         account_type: Some("oauth".to_owned()),
         concurrency: Some(concurrency),
         priority: Some(priority),
@@ -1218,7 +1760,8 @@ fn normalize_manual_token(
                 ("imported_at".to_owned(), json!(now_iso(now_ms))),
                 ("access_token_sha256".to_owned(), json!(sha256_hex(token))),
             ]);
-            let mut settings = manual_settings(credentials, extra, 3.0, 50.0, Some(false));
+            let mut settings =
+                manual_settings("openai", credentials, extra, 3.0, 50.0, Some(false));
             settings.name = Some(
                 account
                     .email
@@ -1228,32 +1771,43 @@ fn normalize_manual_token(
             account.sub2api_settings = Some(settings);
             Ok(account)
         }
-        InputMode::Rt | InputMode::MobileRt => {
-            let mobile = mode == InputMode::MobileRt;
-            let source_type = if mobile {
-                SourceType::ManualMobileRt
+        InputMode::Rt => {
+            let kind =
+                classify_refresh_token(token).ok_or_else(|| "无法识别 RT 格式".to_owned())?;
+            let grok = kind == RefreshTokenKind::Grok;
+            let source_type = if grok {
+                SourceType::ManualGrokRt
             } else {
                 SourceType::ManualRt
             };
-            let token_label = if mobile { "Mobile RT" } else { "RT" };
-            let import_source = if mobile {
-                "manual_mobile_refresh_token"
+            let platform = if grok { "grok" } else { "openai" };
+            let provider = if grok { "xai" } else { "openai" };
+            let display_name = if grok { "Grok RT" } else { "OpenAI RT" };
+            let import_source = if grok {
+                "manual_grok_refresh_token"
             } else {
                 "manual_refresh_token"
             };
             let credentials = Map::from_iter([("refresh_token".to_owned(), json!(token))]);
             let extra = Map::from_iter([
-                ("auth_provider".to_owned(), json!("openai")),
+                ("auth_provider".to_owned(), json!(provider)),
                 ("source".to_owned(), json!(import_source)),
             ]);
-            let mut settings = manual_settings(credentials, extra, 10.0, 1.0, None);
+            let mut settings = manual_settings(
+                platform,
+                credentials,
+                extra,
+                if grok { 1.0 } else { 10.0 },
+                1.0,
+                None,
+            );
             let record = Map::from_iter([
                 ("refresh_token".to_owned(), json!(token)),
                 (
                     "name".to_owned(),
-                    json!(format!("OpenAI {token_label} {}", index + 1)),
+                    json!(format!("{display_name} {}", index + 1)),
                 ),
-                ("auth_provider".to_owned(), json!("openai")),
+                ("auth_provider".to_owned(), json!(provider)),
             ]);
             let mut account = normalize_record(
                 &record,
@@ -1272,7 +1826,38 @@ fn normalize_manual_token(
             account.warnings.clear();
             Ok(account)
         }
-        InputMode::Json => Err("请选择 RT、Mobile RT 或 AT 输入".to_owned()),
+        InputMode::GrokSso => {
+            let source_type = SourceType::ManualGrokSso;
+            let import_source = "manual_grok_sso";
+            let credentials = Map::from_iter([("refresh_token".to_owned(), json!(token))]);
+            let extra = Map::from_iter([
+                ("auth_provider".to_owned(), json!("xai")),
+                ("source".to_owned(), json!(import_source)),
+            ]);
+            let mut settings = manual_settings("grok", credentials, extra, 1.0, 1.0, None);
+            let record = Map::from_iter([
+                ("refresh_token".to_owned(), json!(token)),
+                ("name".to_owned(), json!(format!("SSO {}", index + 1))),
+                ("auth_provider".to_owned(), json!("xai")),
+            ]);
+            let mut account = normalize_record(
+                &record,
+                NormalizeOptions {
+                    source_name,
+                    source_path: &source_path,
+                    source_type,
+                    last_refresh_fallback: None,
+                    preserved_cpa_fields: None,
+                    sub2api_settings: Some(settings.clone()),
+                    now_ms,
+                },
+            )?;
+            settings.name = Some(account.name.clone());
+            account.sub2api_settings = Some(settings);
+            account.warnings.clear();
+            Ok(account)
+        }
+        InputMode::Json | InputMode::AgentIdentity => Err("请选择一种 token 输入模式".to_owned()),
     }
 }
 
@@ -1292,6 +1877,13 @@ pub fn parse_manual_tokens(
         .lines()
         .map(str::trim)
         .filter(|token| !token.is_empty())
+        .map(|token| {
+            if mode == InputMode::GrokSso {
+                normalize_grok_sso_token(token)
+            } else {
+                token.to_owned()
+            }
+        })
         .collect::<Vec<_>>();
     let mut accounts = Vec::new();
     let mut issues = Vec::new();
@@ -1303,15 +1895,16 @@ pub fn parse_manual_tokens(
         ));
     }
     for (index, token) in tokens.into_iter().take(500).enumerate() {
-        if let Some(reason) = manual_token_error(token, mode) {
+        if let Some(reason) = manual_token_error(&token, mode) {
             issues.push(ParseIssue::new(source_name, reason).at_path(format!("$[{index}]")));
             continue;
         }
         let token_kind = match mode {
             InputMode::At => "at",
             InputMode::Rt => "rt",
-            InputMode::MobileRt => "mobile_rt",
+            InputMode::GrokSso => "grok_sso",
             InputMode::Json => "json",
+            InputMode::AgentIdentity => "agent_identity",
         };
         let key = format!("{token_kind}:{token}");
         if !seen.insert(key) {
@@ -1321,7 +1914,7 @@ pub fn parse_manual_tokens(
             );
             continue;
         }
-        match normalize_manual_token(token, mode, index, source_name, now_ms) {
+        match normalize_manual_token(&token, mode, index, source_name, now_ms) {
             Ok(account) => accounts.push(account),
             Err(reason) => {
                 issues.push(ParseIssue::new(source_name, reason).at_path(format!("$[{index}]")))
@@ -1370,7 +1963,7 @@ pub fn normalize_validated_at(
         ("access_token_sha256".to_owned(), json!(sha256_hex(token))),
         ("email".to_owned(), json!(info.email)),
     ]);
-    let settings = manual_settings(credentials.clone(), extra, 3.0, 50.0, Some(false));
+    let settings = manual_settings("openai", credentials.clone(), extra, 3.0, 50.0, Some(false));
     let mut record = credentials;
     record.insert("name".to_owned(), json!(info.email));
     record.insert(
@@ -1405,11 +1998,10 @@ pub fn normalize_validated_at(
 pub fn normalize_refreshed_rt(
     original_refresh_token: &str,
     info: &OAuthTokenInfo,
-    mode: InputMode,
     index: usize,
     now_ms: f64,
 ) -> Result<NormalizedAccount, String> {
-    let mobile = mode == InputMode::MobileRt;
+    let mobile = info.client_id == OPENAI_MOBILE_CLIENT_ID;
     let source_name = if mobile {
         "手动 Mobile RT"
     } else {
@@ -1473,7 +2065,7 @@ pub fn normalize_refreshed_rt(
             extra.insert(key.to_owned(), Value::String(value));
         }
     }
-    let settings = manual_settings(credentials.clone(), extra, 10.0, 1.0, None);
+    let settings = manual_settings("openai", credentials.clone(), extra, 10.0, 1.0, None);
     let mut record = credentials;
     record.insert(
         "name".to_owned(),
@@ -1512,6 +2104,176 @@ pub fn normalize_refreshed_rt(
     Ok(account)
 }
 
+pub fn normalize_grok_oauth(
+    original_refresh_token: Option<&str>,
+    info: &OAuthTokenInfo,
+    mode: InputMode,
+    index: usize,
+    now_ms: f64,
+) -> Result<NormalizedAccount, String> {
+    if !matches!(mode, InputMode::Rt | InputMode::GrokSso) {
+        return Err("Grok OAuth 输入模式无效".to_owned());
+    }
+    let source_type = if mode == InputMode::GrokSso {
+        SourceType::ManualGrokSso
+    } else {
+        SourceType::ManualGrokRt
+    };
+    let source_name = if mode == InputMode::GrokSso {
+        "手动 SSO"
+    } else {
+        "手动 Grok RT"
+    };
+    let access_token = info
+        .fields
+        .get("access_token")
+        .and_then(non_empty)
+        .ok_or_else(|| "xAI OAuth 返回结果中缺少 access_token".to_owned())?;
+    let refresh_token = first_non_empty([
+        info.fields.get("refresh_token").and_then(non_empty),
+        original_refresh_token.map(ToOwned::to_owned),
+    ]);
+    let id_token = info.fields.get("id_token").and_then(non_empty);
+    let access_claims = parse_jwt_payload(Some(&access_token));
+    let id_claims = parse_jwt_payload(id_token.as_deref());
+    let claim_value = |key: &str| {
+        id_claims
+            .as_ref()
+            .and_then(|claims| claims.get(key))
+            .and_then(non_empty)
+            .or_else(|| {
+                access_claims
+                    .as_ref()
+                    .and_then(|claims| claims.get(key))
+                    .and_then(non_empty)
+            })
+    };
+    let expires_at = unix_seconds(info.fields.get("expires_at")).or_else(|| {
+        info.fields
+            .get("expires_in")
+            .and_then(number)
+            .filter(|value| *value > 0.0)
+            .map(|value| (now_ms / 1000.0).floor() as i64 + value.floor() as i64)
+    });
+    let expires_at_iso = expires_at.and_then(|value| date_to_iso(value as f64 * 1000.0));
+    let email = first_non_empty([
+        info.fields.get("email").and_then(non_empty),
+        claim_value("email"),
+    ]);
+    let subject = first_non_empty([
+        info.fields.get("sub").and_then(non_empty),
+        claim_value("sub"),
+    ]);
+
+    let mut credentials = JsonMap::new();
+    credentials.insert("access_token".to_owned(), json!(access_token));
+    insert_optional(
+        &mut credentials,
+        "refresh_token",
+        refresh_token.clone().map(Value::String),
+    );
+    insert_optional(
+        &mut credentials,
+        "id_token",
+        id_token.clone().map(Value::String),
+    );
+    credentials.insert(
+        "token_type".to_owned(),
+        json!(
+            info.fields
+                .get("token_type")
+                .and_then(non_empty)
+                .unwrap_or_else(|| "Bearer".to_owned())
+        ),
+    );
+    insert_optional(
+        &mut credentials,
+        "expires_at",
+        expires_at_iso.clone().map(Value::String),
+    );
+    credentials.insert(
+        "client_id".to_owned(),
+        json!(if info.client_id.trim().is_empty() {
+            GROK_CLIENT_ID
+        } else {
+            info.client_id.as_str()
+        }),
+    );
+    credentials.insert(
+        "scope".to_owned(),
+        json!(
+            info.fields
+                .get("scope")
+                .and_then(non_empty)
+                .unwrap_or_else(|| GROK_SCOPE.to_owned())
+        ),
+    );
+    credentials.insert(
+        "base_url".to_owned(),
+        json!(
+            info.fields
+                .get("base_url")
+                .and_then(non_empty)
+                .unwrap_or_else(|| GROK_BASE_URL.to_owned())
+        ),
+    );
+    for (key, value) in [
+        ("email", email.clone()),
+        ("sub", subject.clone()),
+        ("team_id", claim_value("team_id")),
+        (
+            "subscription_tier",
+            first_non_empty([
+                info.fields.get("subscription_tier").and_then(non_empty),
+                claim_value("subscription_tier"),
+            ]),
+        ),
+        (
+            "entitlement_status",
+            first_non_empty([
+                info.fields.get("entitlement_status").and_then(non_empty),
+                claim_value("entitlement_status"),
+            ]),
+        ),
+    ] {
+        insert_optional(&mut credentials, key, value.map(Value::String));
+    }
+
+    let import_source = if mode == InputMode::GrokSso {
+        "manual_grok_sso"
+    } else {
+        "manual_grok_refresh_token"
+    };
+    let extra = Map::from_iter([
+        ("auth_provider".to_owned(), json!("xai")),
+        ("source".to_owned(), json!(import_source)),
+        ("last_refresh".to_owned(), json!(now_iso(now_ms))),
+    ]);
+    let mut settings = manual_settings("grok", credentials.clone(), extra, 1.0, 1.0, None);
+    let name = email
+        .clone()
+        .unwrap_or_else(|| format!("Grok OAuth {}", index + 1));
+    settings.name = Some(name.clone());
+
+    let mut record = credentials;
+    record.insert("name".to_owned(), json!(name));
+    record.insert("auth_provider".to_owned(), json!("xai"));
+    record.insert("last_refresh".to_owned(), json!(now_iso(now_ms)));
+    let source_path = format!("$[{index}]");
+    normalize_record(
+        &record,
+        NormalizeOptions {
+            source_name,
+            source_path: &source_path,
+            source_type,
+            last_refresh_fallback: None,
+            preserved_cpa_fields: None,
+            sub2api_settings: Some(settings),
+            now_ms,
+        },
+    )
+}
+
 fn insert_optional(map: &mut JsonMap, key: &str, value: Option<Value>) {
     if let Some(value) = value.filter(|value| !value.is_null()) {
         map.insert(key.to_owned(), value);
@@ -1534,7 +2296,253 @@ fn bridge_metadata(settings: &Sub2ApiSettings) -> Value {
     })
 }
 
+fn is_grok_account(account: &NormalizedAccount) -> bool {
+    account
+        .sub2api_settings
+        .as_ref()
+        .and_then(|settings| settings.platform.as_deref())
+        .is_some_and(|platform| platform.eq_ignore_ascii_case("grok"))
+        || matches!(
+            account.auth_provider.to_ascii_lowercase().as_str(),
+            "xai" | "grok"
+        )
+        || account
+            .preserved_cpa_fields
+            .as_ref()
+            .and_then(|fields| fields.get("type"))
+            .and_then(non_empty)
+            .is_some_and(|kind| matches!(kind.to_ascii_lowercase().as_str(), "xai" | "grok"))
+}
+
+fn account_credential(account: &NormalizedAccount, key: &str) -> Option<String> {
+    account
+        .sub2api_settings
+        .as_ref()
+        .and_then(|settings| settings.credentials.get(key))
+        .and_then(non_empty)
+        .or_else(|| {
+            account
+                .preserved_cpa_fields
+                .as_ref()
+                .and_then(|fields| fields.get(key))
+                .and_then(non_empty)
+        })
+}
+
+fn to_cpa_grok_record(account: &NormalizedAccount, now_ms: f64) -> Value {
+    let mut output = account.preserved_cpa_fields.clone().unwrap_or_default();
+    let expired = account
+        .export_expires_at
+        .clone()
+        .or_else(|| account_credential(account, "expires_at"))
+        .or_else(|| normalize_timestamp(output.get("expired")))
+        .or_else(|| date_to_iso(now_ms + 21_600_000.0));
+    let expires_in = get_expires_in(expired.as_deref(), now_ms)
+        .or_else(|| output.get("expires_in").and_then(to_i64))
+        .unwrap_or(21_600);
+
+    output.insert("type".to_owned(), json!("xai"));
+    output.insert("auth_kind".to_owned(), json!("oauth"));
+    insert_optional(
+        &mut output,
+        "email",
+        account
+            .email
+            .clone()
+            .or_else(|| account_credential(account, "email"))
+            .map(Value::String),
+    );
+    insert_optional(
+        &mut output,
+        "sub",
+        account_credential(account, "sub")
+            .or_else(|| account.user_id.clone())
+            .map(Value::String),
+    );
+    output.insert("access_token".to_owned(), json!(account.access_token));
+    output.insert(
+        "refresh_token".to_owned(),
+        json!(account.refresh_token.clone().unwrap_or_default()),
+    );
+    output.insert(
+        "id_token".to_owned(),
+        json!(account.input_id_token.clone().unwrap_or_default()),
+    );
+    output.insert(
+        "token_type".to_owned(),
+        json!(account_credential(account, "token_type").unwrap_or_else(|| "Bearer".to_owned())),
+    );
+    output.insert("expires_in".to_owned(), json!(expires_in));
+    insert_optional(&mut output, "expired", expired.map(Value::String));
+    output.insert("last_refresh".to_owned(), json!(account.last_refresh));
+    output
+        .entry("redirect_uri".to_owned())
+        .or_insert_with(|| json!(""));
+    output.insert("token_endpoint".to_owned(), json!(GROK_TOKEN_ENDPOINT));
+    output.insert(
+        "base_url".to_owned(),
+        json!(account_credential(account, "base_url").unwrap_or_else(|| GROK_BASE_URL.to_owned())),
+    );
+    output.insert("disabled".to_owned(), Value::Bool(account.disabled));
+    output.entry("headers".to_owned()).or_insert_with(|| {
+        json!({
+            "X-XAI-Token-Auth": "xai-grok-cli",
+            "x-grok-client-identifier": "grok-shell",
+            "x-grok-client-version": "0.2.93",
+        })
+    });
+    if let Some(settings) = &account.sub2api_settings {
+        output.insert(SESSION_BRIDGE_KEY.to_owned(), bridge_metadata(settings));
+    } else {
+        output.remove(SESSION_BRIDGE_KEY);
+    }
+    Value::Object(output)
+}
+
+fn agent_identity_task_id(account: &NormalizedAccount) -> Option<String> {
+    account_credential(account, "task_id")
+}
+
+fn to_cpa_agent_identity_record(account: &NormalizedAccount) -> Value {
+    let settings = account.sub2api_settings.as_ref();
+    let credentials = settings.map(|settings| &settings.credentials);
+    let credential_string = |key: &str| {
+        credentials
+            .and_then(|credentials| credentials.get(key))
+            .and_then(non_empty)
+    };
+
+    let mut identity = JsonMap::new();
+    for (key, value) in [
+        ("agent_runtime_id", credential_string("agent_runtime_id")),
+        ("agent_private_key", credential_string("agent_private_key")),
+        ("task_id", credential_string("task_id")),
+        (
+            "account_id",
+            account
+                .account_id
+                .clone()
+                .or_else(|| credential_string("chatgpt_account_id"))
+                .or_else(|| credential_string("account_id")),
+        ),
+        (
+            "chatgpt_user_id",
+            account
+                .user_id
+                .clone()
+                .or_else(|| credential_string("chatgpt_user_id")),
+        ),
+        (
+            "email",
+            account.email.clone().or_else(|| credential_string("email")),
+        ),
+        (
+            "plan_type",
+            account
+                .plan_type
+                .clone()
+                .or_else(|| credential_string("plan_type")),
+        ),
+    ] {
+        insert_optional(&mut identity, key, value.map(Value::String));
+    }
+    identity.insert(
+        "chatgpt_account_is_fedramp".to_owned(),
+        Value::Bool(
+            credentials
+                .and_then(|credentials| credentials.get("chatgpt_account_is_fedramp"))
+                .and_then(bool_value)
+                .unwrap_or(false),
+        ),
+    );
+
+    let mut output = JsonMap::new();
+    if let Some(account_fields) = settings.map(|settings| &settings.account_fields) {
+        insert_optional(
+            &mut output,
+            "priority",
+            account_fields
+                .get("priority")
+                .and_then(to_i64)
+                .map(|value| json!(value)),
+        );
+        for key in ["note", "prefix", "proxy_url"] {
+            insert_optional(
+                &mut output,
+                key,
+                account_fields
+                    .get(key)
+                    .and_then(non_empty)
+                    .map(Value::String),
+            );
+        }
+        insert_optional(
+            &mut output,
+            "websockets",
+            account_fields
+                .get("websockets")
+                .and_then(bool_value)
+                .map(Value::Bool),
+        );
+        let headers = account_fields
+            .get("headers")
+            .and_then(Value::as_object)
+            .map(|headers| {
+                headers
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        non_empty(value).map(|value| (key.clone(), Value::String(value)))
+                    })
+                    .collect::<JsonMap>()
+            })
+            .filter(|headers| !headers.is_empty());
+        insert_optional(&mut output, "headers", headers.map(Value::Object));
+    }
+    output.insert("type".to_owned(), json!(CPA_AGENT_IDENTITY_TYPE));
+    output.insert(
+        "auth_mode".to_owned(),
+        json!(OPENAI_AGENT_IDENTITY_AUTH_MODE),
+    );
+    output.insert("agent_identity".to_owned(), Value::Object(identity));
+    output.insert("name".to_owned(), json!(account.name));
+    insert_optional(
+        &mut output,
+        "email",
+        account.email.clone().map(Value::String),
+    );
+    insert_optional(
+        &mut output,
+        "account_id",
+        account.account_id.clone().map(Value::String),
+    );
+    insert_optional(
+        &mut output,
+        "chatgpt_account_id",
+        account.account_id.clone().map(Value::String),
+    );
+    insert_optional(
+        &mut output,
+        "plan_type",
+        account.plan_type.clone().map(Value::String),
+    );
+    insert_optional(
+        &mut output,
+        "chatgpt_plan_type",
+        account.plan_type.clone().map(Value::String),
+    );
+    if account.disabled {
+        output.insert("disabled".to_owned(), Value::Bool(true));
+    }
+    Value::Object(output)
+}
+
 pub fn to_cpa_record(account: &NormalizedAccount, now_ms: f64) -> Value {
+    if account.source_type == SourceType::AgentIdentity {
+        return to_cpa_agent_identity_record(account);
+    }
+    if is_grok_account(account) {
+        return to_cpa_grok_record(account, now_ms);
+    }
     let mut output = account.preserved_cpa_fields.clone().unwrap_or_default();
     let preserved = output.clone();
     let account_id = first_non_empty([
@@ -1708,7 +2716,224 @@ fn get_expires_in(expires_at: Option<&str>, now_ms: f64) -> Option<i64> {
         .then(|| ((expires - now_ms) / 1000.0).floor().max(0.0) as i64)
 }
 
+fn to_sub2api_agent_identity_account(account: &NormalizedAccount) -> Value {
+    let settings = account.sub2api_settings.as_ref();
+    let mut credentials = settings
+        .map(|settings| settings.credentials.clone())
+        .unwrap_or_default();
+    for key in [
+        "access_token",
+        "accessToken",
+        "refresh_token",
+        "refreshToken",
+        "session_token",
+        "sessionToken",
+        "id_token",
+        "idToken",
+        "expires_at",
+        "expiresAt",
+        "expires_in",
+        "expiresIn",
+    ] {
+        credentials.remove(key);
+    }
+    credentials.insert(
+        "auth_mode".to_owned(),
+        json!(OPENAI_AGENT_IDENTITY_AUTH_MODE),
+    );
+
+    let non_negative =
+        |value: Option<f64>, fallback: f64| value.filter(|value| *value >= 0.0).unwrap_or(fallback);
+    let mut output = settings
+        .map(|settings| settings.account_fields.clone())
+        .unwrap_or_default();
+    output.insert(
+        "name".to_owned(),
+        json!(
+            first_non_empty([
+                settings.and_then(|settings| settings.name.clone()),
+                account.email.clone(),
+                Some(account.name.clone()),
+            ])
+            .unwrap_or_else(|| "Agent Identity".to_owned())
+        ),
+    );
+    output.insert("platform".to_owned(), json!("openai"));
+    output.insert("type".to_owned(), json!("oauth"));
+    output.remove("expires_at");
+    output.remove("auto_pause_on_expired");
+    output.insert(
+        "concurrency".to_owned(),
+        json!(non_negative(
+            settings.and_then(|settings| settings.concurrency),
+            10.0
+        )),
+    );
+    output.insert(
+        "priority".to_owned(),
+        json!(non_negative(
+            settings.and_then(|settings| settings.priority),
+            1.0
+        )),
+    );
+    output.insert(
+        "rate_multiplier".to_owned(),
+        json!(non_negative(
+            settings.and_then(|settings| settings.rate_multiplier),
+            1.0
+        )),
+    );
+    if settings
+        .and_then(|settings| settings.disabled)
+        .unwrap_or(account.disabled)
+    {
+        output.insert("disabled".to_owned(), Value::Bool(true));
+    } else {
+        output.remove("disabled");
+    }
+    output.insert("credentials".to_owned(), Value::Object(credentials));
+    let extra = settings
+        .map(|settings| settings.extra.clone())
+        .unwrap_or_default();
+    if extra.is_empty() {
+        output.remove("extra");
+    } else {
+        output.insert("extra".to_owned(), Value::Object(extra));
+    }
+    Value::Object(output)
+}
+
+fn to_sub2api_grok_account(account: &NormalizedAccount) -> Value {
+    let settings = account.sub2api_settings.as_ref();
+    let mut credentials = settings
+        .map(|settings| settings.credentials.clone())
+        .unwrap_or_default();
+    credentials.insert("access_token".to_owned(), json!(account.access_token));
+    insert_optional(
+        &mut credentials,
+        "refresh_token",
+        account.refresh_token.clone().map(Value::String),
+    );
+    insert_optional(
+        &mut credentials,
+        "id_token",
+        account.input_id_token.clone().map(Value::String),
+    );
+    insert_optional(
+        &mut credentials,
+        "expires_at",
+        account.token_expires_at.clone().map(Value::String),
+    );
+    credentials.insert(
+        "token_type".to_owned(),
+        json!(account_credential(account, "token_type").unwrap_or_else(|| "Bearer".to_owned())),
+    );
+    credentials.insert(
+        "client_id".to_owned(),
+        json!(
+            account_credential(account, "client_id").unwrap_or_else(|| GROK_CLIENT_ID.to_owned())
+        ),
+    );
+    credentials.insert(
+        "scope".to_owned(),
+        json!(account_credential(account, "scope").unwrap_or_else(|| GROK_SCOPE.to_owned())),
+    );
+    credentials.insert(
+        "base_url".to_owned(),
+        json!(account_credential(account, "base_url").unwrap_or_else(|| GROK_BASE_URL.to_owned())),
+    );
+    for (key, value) in [
+        (
+            "email",
+            account
+                .email
+                .clone()
+                .or_else(|| account_credential(account, "email")),
+        ),
+        (
+            "sub",
+            account_credential(account, "sub").or_else(|| account.user_id.clone()),
+        ),
+        ("team_id", account_credential(account, "team_id")),
+        (
+            "subscription_tier",
+            account_credential(account, "subscription_tier"),
+        ),
+        (
+            "entitlement_status",
+            account_credential(account, "entitlement_status"),
+        ),
+    ] {
+        insert_optional(&mut credentials, key, value.map(Value::String));
+    }
+
+    let non_negative =
+        |value: Option<f64>, fallback: f64| value.filter(|value| *value >= 0.0).unwrap_or(fallback);
+    let mut output = settings
+        .map(|settings| settings.account_fields.clone())
+        .unwrap_or_default();
+    output.insert(
+        "name".to_owned(),
+        json!(
+            first_non_empty([
+                settings.and_then(|settings| settings.name.clone()),
+                account.email.clone(),
+                Some(account.name.clone()),
+            ])
+            .unwrap_or_else(|| "Grok Account".to_owned())
+        ),
+    );
+    output.insert("platform".to_owned(), json!("grok"));
+    output.insert("type".to_owned(), json!("oauth"));
+    output.insert(
+        "concurrency".to_owned(),
+        json!(non_negative(
+            settings.and_then(|settings| settings.concurrency),
+            1.0
+        )),
+    );
+    output.insert(
+        "priority".to_owned(),
+        json!(non_negative(
+            settings.and_then(|settings| settings.priority),
+            1.0
+        )),
+    );
+    output.insert(
+        "rate_multiplier".to_owned(),
+        json!(non_negative(
+            settings.and_then(|settings| settings.rate_multiplier),
+            1.0
+        )),
+    );
+    if settings
+        .and_then(|settings| settings.disabled)
+        .unwrap_or(account.disabled)
+    {
+        output.insert("disabled".to_owned(), Value::Bool(true));
+    } else {
+        output.remove("disabled");
+    }
+    output.insert("credentials".to_owned(), Value::Object(credentials));
+    let extra = settings.map_or_else(
+        || without_credential_fields(&account.preserved_cpa_fields.clone().unwrap_or_default()),
+        |settings| settings.extra.clone(),
+    );
+    if extra.is_empty() {
+        output.remove("extra");
+    } else {
+        output.insert("extra".to_owned(), Value::Object(extra));
+    }
+    Value::Object(output)
+}
+
 pub fn to_sub2api_account(account: &NormalizedAccount, now_ms: f64) -> Value {
+    if account.source_type == SourceType::AgentIdentity {
+        return to_sub2api_agent_identity_account(account);
+    }
+    if is_grok_account(account) {
+        return to_sub2api_grok_account(account);
+    }
     let settings = account.sub2api_settings.as_ref();
     let mut credentials = settings
         .map(|settings| settings.credentials.clone())
@@ -2037,11 +3262,31 @@ pub fn build_sub2api_document(accounts: &[NormalizedAccount], now_ms: f64) -> Va
     Value::Object(merged)
 }
 
+pub fn output_supported(accounts: &[NormalizedAccount], format: OutputFormat) -> bool {
+    format != OutputFormat::Cpa
+        || accounts.iter().all(|account| {
+            account.source_type != SourceType::AgentIdentity
+                || agent_identity_task_id(account).is_some()
+        })
+}
+
+pub fn output_unsupported_reason(
+    accounts: &[NormalizedAccount],
+    format: OutputFormat,
+) -> Option<&'static str> {
+    (!output_supported(accounts, format)).then_some(
+        "Agent Identity 缺少 task_id，CPA 无法使用该签名凭证；请先在 Sub2API 完成一次注册",
+    )
+}
+
 pub fn build_output_document(
     accounts: &[NormalizedAccount],
     format: OutputFormat,
     now_ms: f64,
 ) -> Value {
+    if !output_supported(accounts, format) {
+        return Value::Null;
+    }
     match format {
         OutputFormat::Sub2Api => build_sub2api_document(accounts, now_ms),
         OutputFormat::Cpa if accounts.len() == 1 => to_cpa_record(&accounts[0], now_ms),
@@ -2117,6 +3362,11 @@ pub fn download_descriptor(
 ) -> Result<DownloadDescriptor, String> {
     if accounts.is_empty() {
         return Err("没有可导出的账号".to_owned());
+    }
+    if !output_supported(accounts, format) {
+        return Err(output_unsupported_reason(accounts, format)
+            .unwrap_or("当前凭证无法导出为所选格式")
+            .to_owned());
     }
     if format == OutputFormat::Cpa && accounts.len() > 1 {
         let entries = accounts

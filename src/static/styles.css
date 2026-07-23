@@ -63,6 +63,7 @@
 }
 
 :root[data-theme="light"] .topbar-meta > span,
+:root[data-theme="light"] .support-link,
 :root[data-theme="light"] .theme-toggle,
 :root[data-theme="light"] .github-link,
 :root[data-theme="light"] .hero-pills span,
@@ -266,7 +267,8 @@ a {
   gap: 8px;
 }
 
-.topbar-meta > span {
+.topbar-meta > span,
+.support-link {
   display: inline-flex;
   align-items: center;
   min-height: 32px;
@@ -278,6 +280,22 @@ a {
   font-family: var(--mono);
   font-size: 0.68rem;
   letter-spacing: 0.03em;
+}
+
+.support-link {
+  text-decoration: none;
+  transition: border-color 160ms ease, color 160ms ease, background 160ms ease;
+}
+
+.support-link:hover {
+  border-color: rgb(var(--brand-rgb) / 0.45);
+  color: var(--brand);
+  background: rgb(var(--brand-rgb) / 0.08);
+}
+
+.support-link:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
 }
 
 .live-dot {
@@ -357,10 +375,6 @@ a {
   padding: 14px 2px 16px;
 }
 
-.hero-copy {
-  max-width: none;
-}
-
 .section-kicker {
   margin: 0 0 5px;
   color: var(--brand);
@@ -371,7 +385,6 @@ a {
 }
 
 .hero-lead {
-  max-width: none;
   margin: 0;
   color: var(--muted-strong);
   font-size: clamp(0.88rem, 1.05vw, 0.98rem);
@@ -508,14 +521,16 @@ a {
   color: var(--text);
 }
 
+.format-option:disabled {
+  color: var(--muted);
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .format-option.is-active {
   border-color: rgb(var(--brand-rgb) / 0.3);
   color: var(--text);
   background: rgb(var(--brand-rgb) / 0.1);
-}
-
-.format-option strong {
-  font-size: inherit;
 }
 
 .format-option.is-active strong {
@@ -579,7 +594,7 @@ a {
 
 .input-mode-switch {
   display: grid;
-  grid-template-columns: repeat(4, minmax(68px, 1fr));
+  grid-template-columns: repeat(5, minmax(54px, 1fr));
   gap: 3px;
   padding: 3px;
   border: 1px solid var(--line);
@@ -1016,6 +1031,19 @@ tbody tr:hover:not(.empty-row) {
   background: rgb(var(--brand-rgb) / 0.07);
 }
 
+.source-chip.source-agent_identity {
+  border-color: rgb(var(--brand-rgb) / 0.24);
+  color: var(--brand);
+  background: rgb(var(--brand-rgb) / 0.07);
+}
+
+.source-chip.source-manual_grok_rt,
+.source-chip.source-manual_grok_sso {
+  border-color: rgb(var(--amber-rgb) / 0.24);
+  color: var(--amber);
+  background: rgb(var(--amber-rgb) / 0.07);
+}
+
 .status-stack {
   display: flex;
   flex-direction: column;
@@ -1174,7 +1202,6 @@ tbody tr:hover:not(.empty-row) {
   min-height: 330px;
   max-height: 560px;
   padding: 16px;
-  resize: vertical;
 }
 
 .toast {
@@ -1257,7 +1284,8 @@ tbody tr:hover:not(.empty-row) {
     padding-bottom: 10px;
   }
 
-  .topbar-meta > span {
+  .topbar-meta > span,
+  .support-link {
     min-height: 29px;
     font-size: 0.61rem;
   }
@@ -1328,7 +1356,7 @@ tbody tr:hover:not(.empty-row) {
   }
 
   .input-mode-switch {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     width: 100%;
     flex: 1;
   }

@@ -14,12 +14,14 @@ use web_sys::{
 use super::{
     api,
     credentials::{
-        build_output_document, credential_keys, download_descriptor, normalize_refreshed_rt,
-        normalize_validated_at, parse_credential_text, parse_manual_tokens, redact,
+        build_output_document, credential_keys, download_descriptor, normalize_grok_oauth,
+        normalize_refreshed_rt, normalize_validated_at, output_supported,
+        output_unsupported_reason, parse_credential_text, parse_manual_tokens, redact,
         sub2api_document_conflicts,
     },
     model::{
         DownloadDescriptor, InputMode, NormalizedAccount, OutputFormat, ParseIssue, ParseResult,
+        RefreshTokenKind, SourceType,
     },
     zip::build_zip,
 };
@@ -29,8 +31,20 @@ const MAX_TOTAL_IMPORT_SIZE: usize = 50 * 1024 * 1024;
 const MAX_MANUAL_INPUT_SIZE: usize = 8 * 1024 * 1024;
 const MAX_FILES: usize = 500;
 const TOKEN_VALIDATION_CONCURRENCY: usize = 3;
-const TOKEN_VALIDATION_WATCHDOG_PER_BATCH_MS: i32 = 15_000;
+const TOKEN_VALIDATION_WATCHDOG_PER_BATCH_MS: i32 = 20_000;
+const GROK_SSO_WATCHDOG_PER_BATCH_MS: i32 = 100_000;
 const TOKEN_VALIDATION_WATCHDOG_MARGIN_MS: i32 = 5_000;
+const FORMAT_CONTROLS: [(&str, OutputFormat); 2] = [
+    ("format-sub2api", OutputFormat::Sub2Api),
+    ("format-cpa", OutputFormat::Cpa),
+];
+const INPUT_MODE_CONTROLS: [(&str, InputMode); 5] = [
+    ("input-mode-json", InputMode::Json),
+    ("input-mode-agent-identity", InputMode::AgentIdentity),
+    ("input-mode-rt", InputMode::Rt),
+    ("input-mode-at", InputMode::At),
+    ("input-mode-grok-sso", InputMode::GrokSso),
+];
 
 type SharedApp = Rc<RefCell<App>>;
 
@@ -222,6 +236,16 @@ fn format_issues(app: &App) -> Vec<ParseIssue> {
     issues
 }
 
+fn is_json_input_mode(mode: InputMode) -> bool {
+    matches!(mode, InputMode::Json | InputMode::AgentIdentity)
+}
+
+fn has_agent_identity(app: &App) -> bool {
+    app.accounts
+        .iter()
+        .any(|account| account.source_type == SourceType::AgentIdentity)
+}
+
 fn warning_count(app: &App) -> usize {
     app.issues.len()
         + format_issues(app).len()
@@ -233,12 +257,7 @@ fn warning_count(app: &App) -> usize {
 }
 
 fn render_input(app: &App) -> Result<(), JsValue> {
-    for (id, mode) in [
-        ("input-mode-json", InputMode::Json),
-        ("input-mode-rt", InputMode::Rt),
-        ("input-mode-mobile-rt", InputMode::MobileRt),
-        ("input-mode-at", InputMode::At),
-    ] {
+    for (id, mode) in INPUT_MODE_CONTROLS {
         let button: HtmlButtonElement = by_id(id)?;
         let active = app.input_mode == mode;
         set_class(button.as_ref(), "is-active", active);
@@ -248,7 +267,10 @@ fn render_input(app: &App) -> Result<(), JsValue> {
     }
     let input: HtmlTextAreaElement = by_id("session-input")?;
     input.set_read_only(app.validation_in_progress);
-    let token_mode = app.input_mode != InputMode::Json;
+    let token_mode = matches!(
+        app.input_mode,
+        InputMode::Rt | InputMode::At | InputMode::GrokSso
+    );
     if let Some(toolbar) = document()?.query_selector(".input-toolbar")? {
         set_class(&toolbar, "is-token-mode", token_mode);
     }
@@ -273,37 +295,60 @@ fn render_input(app: &App) -> Result<(), JsValue> {
         InputMode::Rt => {
             set_text(
                 "input-description",
-                "粘贴 Codex CLI Refresh Token，换取完整凭证后导出 Sub2API 或 CPA。",
+                "粘贴 OpenAI 或 Grok Refresh Token，自动识别后导出 Sub2API 或 CPA。",
             )?;
             set_text("input-guide-title", "手动输入 RT")?;
             set_text(
                 "input-guide-description",
-                "输入后通过 Codex CLI OAuth 客户端连接 OpenAI 换取完整凭证。",
+                "自动识别 OpenAI Codex、OpenAI Mobile 与 Grok RT，并使用对应 OAuth 客户端换取完整凭证。",
             )?;
             set_text("input-content-label", "RT")?;
-            set_text("input-hint", "每行一个 · 自动去重 · 联网验证账号信息")?;
-            input.set_placeholder("每行粘贴一个 Codex CLI RT");
+            set_text("input-hint", "每行一个 · 自动识别来源 · 联网验证账号信息")?;
+            input.set_placeholder("每行粘贴一个 OpenAI 或 Grok RT");
         }
-        InputMode::MobileRt => {
+        InputMode::GrokSso => {
             set_text(
                 "input-description",
-                "粘贴 OpenAI Mobile Refresh Token，换取完整凭证后导出 Sub2API 或 CPA。",
+                "粘贴 Grok Web SSO，通过 xAI Device Flow 换取 OAuth 凭证。",
             )?;
-            set_text("input-guide-title", "手动输入 Mobile RT")?;
+            set_text("input-guide-title", "导入 SSO")?;
             set_text(
                 "input-guide-description",
-                "输入后通过 OpenAI Mobile OAuth 客户端连接 OpenAI 换取完整凭证。",
+                "支持原始 SSO、sso=、sso-rw= 与完整 Cookie 行；单次转换最长约 90 秒。",
             )?;
-            set_text("input-content-label", "Mobile RT")?;
-            set_text("input-hint", "每行一个 · 自动去重 · 联网验证账号信息")?;
-            input.set_placeholder("每行粘贴一个 Mobile RT");
+            set_text("input-content-label", "SSO")?;
+            set_text(
+                "input-hint",
+                "每行一个 · 自动提取 Cookie · 联网完成 Device Flow",
+            )?;
+            input.set_placeholder("sso=... 或 Cookie: ...; sso=...");
+        }
+        InputMode::AgentIdentity => {
+            set_text(
+                "input-description",
+                "粘贴 Sub2API Agent Identity JSON，本地校验后导出 Sub2API 或 CPA。",
+            )?;
+            set_text("input-guide-title", "导入 Agent Identity（AI）")?;
+            set_text(
+                "input-guide-description",
+                "不需要联网验证；仅检查必要字段和 PKCS#8 Ed25519 私钥格式。",
+            )?;
+            set_text("input-content-label", "Agent Identity JSON")?;
+            set_text(
+                "input-hint",
+                "支持单个、数组、连续 JSON 与文件导入 · 本地转换",
+            )?;
+            input.set_placeholder("{\"auth_mode\":\"agentIdentity\",\"agent_identity\":{...}}");
         }
         InputMode::Json => {
             set_text(
                 "input-description",
                 "粘贴 JSON，或导入一个文件、多个文件及整个目录。",
             )?;
-            set_text("input-guide-title", "自动识别 Session、CPA 与 Sub2API")?;
+            set_text(
+                "input-guide-title",
+                "自动识别 Session、CPA、Sub2API、AI 与 Grok",
+            )?;
             html_element("input-guide-description")?.set_inner_html(
                 "ChatGPT Session 可从 <a href=\"https://chatgpt.com/api/auth/session\" target=\"_blank\" rel=\"noreferrer\">chatgpt.com/api/auth/session</a> 获取。",
             );
@@ -318,23 +363,30 @@ fn render_input(app: &App) -> Result<(), JsValue> {
 }
 
 fn render_format(app: &App) -> Result<(), JsValue> {
-    for (id, format) in [
-        ("format-sub2api", OutputFormat::Sub2Api),
-        ("format-cpa", OutputFormat::Cpa),
-    ] {
+    for (id, format) in FORMAT_CONTROLS {
         let button: HtmlButtonElement = by_id(id)?;
         let active = app.format == format;
         set_class(button.as_ref(), "is-active", active);
         button.set_attribute("aria-selected", if active { "true" } else { "false" })?;
         button.set_tab_index(if active { 0 } else { -1 });
+        let supported = output_supported(&app.accounts, format);
+        button.set_disabled(!supported);
+        button.set_attribute("aria-disabled", if supported { "false" } else { "true" })?;
+        if let Some(reason) = output_unsupported_reason(&app.accounts, format) {
+            button.set_attribute("title", reason)?;
+        } else {
+            button.remove_attribute("title")?;
+        }
         if active {
             html_element("output-panel")?.set_attribute("aria-labelledby", id)?;
         }
     }
-    set_text(
-        "format-description",
-        "将导入的凭证转换为所选认证格式，并保留可恢复的 token、账号信息与过期时间。",
-    )?;
+    let description = if has_agent_identity(app) {
+        "Agent Identity 可转换为 Sub2API 或 CPA 签名凭证，并完整保留身份字段与私钥。"
+    } else {
+        "将导入的凭证转换为所选认证格式，并保留可恢复的 token、账号信息与过期时间。"
+    };
+    set_text("format-description", description)?;
     let download: HtmlButtonElement = by_id("download-output")?;
     if app.format == OutputFormat::Cpa {
         set_text("output-title", "CPA 认证文件")?;
@@ -351,6 +403,9 @@ fn render_format(app: &App) -> Result<(), JsValue> {
 }
 
 fn render_account_status(account: &NormalizedAccount) -> String {
+    if account.source_type == SourceType::AgentIdentity {
+        return "<div class=\"status-stack\"><span class=\"status-chip is-refreshable\">Agent Identity</span><span class=\"expiry-detail\">无需 OAuth 刷新</span></div>".to_owned();
+    }
     let expires_at = format_date(account.token_expires_at.as_deref());
     let (label, tone, detail) = if account.is_refreshable {
         (
@@ -498,7 +553,7 @@ fn render_issues(app: &App) -> Result<(), JsValue> {
 }
 
 fn current_document(app: &App) -> Option<Value> {
-    (!app.accounts.is_empty()).then(|| {
+    (!app.accounts.is_empty() && output_supported(&app.accounts, app.format)).then(|| {
         build_output_document(
             &app.accounts,
             app.format,
@@ -510,6 +565,7 @@ fn current_document(app: &App) -> Option<Value> {
 fn render_output(app: &App) -> Result<(), JsValue> {
     let has_accounts = !app.accounts.is_empty();
     let document = current_document(app);
+    let has_output = document.is_some();
     let preview = document.as_ref().map(|document| {
         if app.reveal_secrets {
             document.clone()
@@ -525,7 +581,7 @@ fn render_output(app: &App) -> Result<(), JsValue> {
     output.set_value(&preview_text);
     for id in ["copy-output", "download-output", "toggle-secrets"] {
         let button: HtmlButtonElement = by_id(id)?;
-        button.set_disabled(!has_accounts);
+        button.set_disabled(!has_output);
     }
     let clear_results: HtmlButtonElement = by_id("clear-results")?;
     clear_results.set_disabled(!has_accounts && app.issues.is_empty());
@@ -586,9 +642,15 @@ fn auto_select_output(app: &mut App, accounts: &[NormalizedAccount]) {
     if sources.len() != 1 {
         return;
     }
-    if sources.contains(&super::model::SourceType::Cpa) {
+    if sources.contains(&SourceType::AgentIdentity) {
+        app.format = if output_supported(accounts, OutputFormat::Cpa) {
+            OutputFormat::Cpa
+        } else {
+            OutputFormat::Sub2Api
+        };
+    } else if sources.contains(&SourceType::Cpa) {
         app.format = OutputFormat::Sub2Api;
-    } else if sources.contains(&super::model::SourceType::Sub2Api) {
+    } else if sources.contains(&SourceType::Sub2Api) {
         app.format = OutputFormat::Cpa;
     }
 }
@@ -620,11 +682,44 @@ fn merge_result(app: &mut App, result: ParseResult, replace: bool) {
     app.reveal_secrets = false;
 }
 
+fn filter_for_input_mode(
+    mut result: ParseResult,
+    mode: InputMode,
+    source_name: &str,
+) -> ParseResult {
+    if mode != InputMode::AgentIdentity {
+        return result;
+    }
+    let before = result.accounts.len();
+    result
+        .accounts
+        .retain(|account| account.source_type == SourceType::AgentIdentity);
+    let skipped = before.saturating_sub(result.accounts.len());
+    if skipped > 0 {
+        result.issues.push(ParseIssue::new(
+            source_name,
+            format!("AI 输入仅接受 Agent Identity JSON，已跳过 {skipped} 个其他凭证"),
+        ));
+    } else if result.accounts.is_empty() && result.issues.is_empty() {
+        result.issues.push(ParseIssue::new(
+            source_name,
+            "未找到可识别的 Agent Identity 凭证",
+        ));
+    }
+    result
+}
+
 fn process_json_input(shared: &SharedApp) -> Result<(), JsValue> {
     let input: HtmlTextAreaElement = by_id("session-input")?;
     let text = input.value();
+    let mode = shared.borrow().input_mode;
     if text.trim().is_empty() {
-        set_input_status("请先粘贴 Session、CPA 或 Sub2API JSON。", Some("error"))?;
+        let message = if mode == InputMode::AgentIdentity {
+            "请先粘贴 Agent Identity JSON。"
+        } else {
+            "请先粘贴 Session、CPA、Sub2API、AI 或 Grok JSON。"
+        };
+        set_input_status(message, Some("error"))?;
         show_toast("没有可解析的输入", true)?;
         return Ok(());
     }
@@ -635,18 +730,32 @@ fn process_json_input(shared: &SharedApp) -> Result<(), JsValue> {
     }
     set_input_status("正在本地解析粘贴内容…", Some("working"))?;
     let now = Date::now();
-    let result = parse_credential_text(&text, "粘贴内容", now);
+    let result = filter_for_input_mode(
+        parse_credential_text(&text, "粘贴内容", now),
+        mode,
+        "粘贴内容",
+    );
     let mut app = shared.borrow_mut();
     cancel_operation(&mut app);
     auto_select_output(&mut app, &result.accounts);
     merge_result(&mut app, result, true);
     render(&app)?;
     if app.accounts.is_empty() {
-        set_input_status("未找到可导出的凭证，请检查 JSON 结构。", Some("error"))?;
+        let message = if mode == InputMode::AgentIdentity {
+            "未找到可导出的 Agent Identity，请检查 JSON 结构与私钥格式。"
+        } else {
+            "未找到可导出的凭证，请检查 JSON 结构。"
+        };
+        set_input_status(message, Some("error"))?;
     } else {
+        let label = if mode == InputMode::AgentIdentity {
+            "AI 本地校验完成"
+        } else {
+            "解析完成"
+        };
         set_input_status(
             &format!(
-                "解析完成：可导出 {} 个账号，发现 {} 条提示。",
+                "{label}：可导出 {} 个账号，发现 {} 条提示。",
                 app.accounts.len(),
                 warning_count(&app)
             ),
@@ -660,8 +769,9 @@ fn token_label(mode: InputMode) -> &'static str {
     match mode {
         InputMode::Json => "JSON",
         InputMode::Rt => "RT",
-        InputMode::MobileRt => "Mobile RT",
         InputMode::At => "AT",
+        InputMode::GrokSso => "SSO",
+        InputMode::AgentIdentity => "AI",
     }
 }
 
@@ -677,9 +787,10 @@ fn prepare_manual_input(shared: &SharedApp) -> Result<Option<ParseResult>, JsVal
         render(&app)?;
         let message = match mode {
             InputMode::At => "请先粘贴 Access Token。",
-            InputMode::MobileRt => "请先粘贴 Mobile RT。",
             InputMode::Rt => "请先粘贴 RT。",
+            InputMode::GrokSso => "请先粘贴 SSO。",
             InputMode::Json => "请先粘贴 JSON。",
+            InputMode::AgentIdentity => "请先粘贴 Agent Identity JSON。",
         };
         set_input_status(message, Some("error"))?;
         return Ok(None);
@@ -739,13 +850,19 @@ fn should_stop_batch(reason: &str) -> bool {
 fn schedule_validation_watchdog(
     shared: SharedApp,
     operation_id: u64,
+    mode: InputMode,
     label: &'static str,
     total: usize,
 ) -> Result<(), JsValue> {
     let batches = total.div_ceil(TOKEN_VALIDATION_CONCURRENCY);
+    let per_batch = if mode == InputMode::GrokSso {
+        GROK_SSO_WATCHDOG_PER_BATCH_MS
+    } else {
+        TOKEN_VALIDATION_WATCHDOG_PER_BATCH_MS
+    };
     let delay_ms = i32::try_from(batches)
         .unwrap_or(i32::MAX)
-        .saturating_mul(TOKEN_VALIDATION_WATCHDOG_PER_BATCH_MS)
+        .saturating_mul(per_batch)
         .saturating_add(TOKEN_VALIDATION_WATCHDOG_MARGIN_MS);
     let callback = Closure::once_into_js(move || {
         let timed_out = {
@@ -793,6 +910,11 @@ fn start_manual_validation(shared: SharedApp) -> Result<(), JsValue> {
         app.operation_id
     };
     let total = parsed.accounts.len();
+    let platform = match mode {
+        InputMode::Rt => "OpenAI / xAI",
+        InputMode::GrokSso => "xAI",
+        _ => "OpenAI",
+    };
     let first_chunk_end = total.min(TOKEN_VALIDATION_CONCURRENCY);
     let first_range = if first_chunk_end == 1 {
         "1".to_owned()
@@ -800,10 +922,11 @@ fn start_manual_validation(shared: SharedApp) -> Result<(), JsValue> {
         format!("1 - {first_chunk_end}")
     };
     set_input_status(
-        &format!("正在连接 OpenAI 验证 {label}：正在处理 {first_range} / {total}…"),
+        &format!("正在连接 {platform} 验证 {label}：正在处理 {first_range} / {total}…"),
         Some("working"),
     )?;
-    if let Err(error) = schedule_validation_watchdog(Rc::clone(&shared), operation_id, label, total)
+    if let Err(error) =
+        schedule_validation_watchdog(Rc::clone(&shared), operation_id, mode, label, total)
     {
         let mut app = shared.borrow_mut();
         app.validation_in_progress = false;
@@ -827,7 +950,7 @@ fn start_manual_validation(shared: SharedApp) -> Result<(), JsValue> {
                 format!("{} - {}", chunk_start + 1, chunk_end)
             };
             let _ = set_input_status(
-                &format!("正在连接 OpenAI 验证 {label}：正在处理 {current} / {total}…"),
+                &format!("正在连接 {platform} 验证 {label}：正在处理 {current} / {total}…"),
                 Some("working"),
             );
             let jobs = parsed.accounts[chunk_start..chunk_end]
@@ -848,14 +971,23 @@ fn start_manual_validation(shared: SharedApp) -> Result<(), JsValue> {
                                     normalize_validated_at(token, &info, index, Date::now())
                                 })
                             }
-                            (InputMode::Rt, Some(token)) => {
-                                api::refresh_token(token).await.and_then(|info| {
-                                    normalize_refreshed_rt(token, &info, mode, index, Date::now())
-                                })
-                            }
-                            (InputMode::MobileRt, Some(token)) => {
-                                api::refresh_mobile_token(token).await.and_then(|info| {
-                                    normalize_refreshed_rt(token, &info, mode, index, Date::now())
+                            (InputMode::Rt, Some(token)) => api::refresh_token(token)
+                                .await
+                                .and_then(|(kind, info)| match kind {
+                                    RefreshTokenKind::OpenAi => {
+                                        normalize_refreshed_rt(token, &info, index, Date::now())
+                                    }
+                                    RefreshTokenKind::Grok => normalize_grok_oauth(
+                                        Some(token),
+                                        &info,
+                                        mode,
+                                        index,
+                                        Date::now(),
+                                    ),
+                                }),
+                            (InputMode::GrokSso, Some(token)) => {
+                                api::convert_grok_sso(token).await.and_then(|info| {
+                                    normalize_grok_oauth(None, &info, mode, index, Date::now())
                                 })
                             }
                             _ => Err(format!("未找到可验证的 {label}")),
@@ -881,7 +1013,7 @@ fn start_manual_validation(shared: SharedApp) -> Result<(), JsValue> {
                 return;
             }
             let _ = set_input_status(
-                &format!("正在连接 OpenAI 验证 {label}：{completed} / {total}…"),
+                &format!("正在连接 {platform} 验证 {label}：{completed} / {total}…"),
                 Some("working"),
             );
             if batch_stop.is_some() {
@@ -933,7 +1065,7 @@ fn start_manual_validation(shared: SharedApp) -> Result<(), JsValue> {
 }
 
 fn process_current_input(shared: &SharedApp) -> Result<(), JsValue> {
-    if shared.borrow().input_mode == InputMode::Json {
+    if is_json_input_mode(shared.borrow().input_mode) {
         process_json_input(shared)
     } else {
         start_manual_validation(Rc::clone(shared))
@@ -955,7 +1087,8 @@ fn collect_files(list: &FileList) -> Vec<File> {
 }
 
 fn process_files(shared: SharedApp, files: Vec<File>) {
-    if shared.borrow().input_mode != InputMode::Json {
+    let mode = shared.borrow().input_mode;
+    if !is_json_input_mode(mode) {
         return;
     }
     let operation_id = {
@@ -1000,10 +1133,14 @@ fn process_files(shared: SharedApp, files: Vec<File>) {
         for file in readable {
             let source_name = file_source_name(&file);
             match JsFuture::from(file.text()).await {
-                Ok(value) => results.push(parse_credential_text(
-                    &value.as_string().unwrap_or_default(),
+                Ok(value) => results.push(filter_for_input_mode(
+                    parse_credential_text(
+                        &value.as_string().unwrap_or_default(),
+                        &source_name,
+                        Date::now(),
+                    ),
+                    mode,
                     &source_name,
-                    Date::now(),
                 )),
                 Err(_) => results.push(ParseResult {
                     accounts: Vec::new(),
@@ -1011,9 +1148,7 @@ fn process_files(shared: SharedApp, files: Vec<File>) {
                 }),
             }
         }
-        if shared.borrow().operation_id != operation_id
-            || shared.borrow().input_mode != InputMode::Json
-        {
+        if shared.borrow().operation_id != operation_id || shared.borrow().input_mode != mode {
             return;
         }
         let mut app = shared.borrow_mut();
@@ -1043,7 +1178,11 @@ fn process_files(shared: SharedApp, files: Vec<File>) {
         let _ = render(&app);
         let _ = if app.accounts.is_empty() {
             set_input_status(
-                "文件中未找到可导出的 Session、CPA 或 Sub2API 账号。",
+                if mode == InputMode::AgentIdentity {
+                    "文件中未找到可导出的 Agent Identity。"
+                } else {
+                    "文件中未找到可导出的 Session、CPA、Sub2API、AI 或 Grok 账号。"
+                },
                 Some("error"),
             )
         } else {
@@ -1217,14 +1356,18 @@ fn schedule_input_processing(shared: &SharedApp, delay_ms: i32) -> Result<(), Js
 }
 
 fn bind_segmented_controls(shared: &SharedApp) -> Result<(), JsValue> {
-    for (id, format) in [
-        ("format-sub2api", OutputFormat::Sub2Api),
-        ("format-cpa", OutputFormat::Cpa),
-    ] {
+    for (id, format) in FORMAT_CONTROLS {
         let button: HtmlButtonElement = by_id(id)?;
         let click_shared = Rc::clone(shared);
         listen_event(&button, "click", move |_| {
             let mut app = click_shared.borrow_mut();
+            if !output_supported(&app.accounts, format) {
+                let message = output_unsupported_reason(&app.accounts, format)
+                    .unwrap_or("当前凭证无法导出为所选格式");
+                drop(app);
+                let _ = show_toast(message, true);
+                return;
+            }
             app.format = format;
             app.reveal_secrets = false;
             let _ = render(&app);
@@ -1244,6 +1387,13 @@ fn bind_segmented_controls(shared: &SharedApp) -> Result<(), JsValue> {
             if let Some(next) = next {
                 event.prevent_default();
                 let mut app = key_shared.borrow_mut();
+                if !output_supported(&app.accounts, next) {
+                    let message = output_unsupported_reason(&app.accounts, next)
+                        .unwrap_or("当前凭证无法导出为所选格式");
+                    drop(app);
+                    let _ = show_toast(message, true);
+                    return;
+                }
                 app.format = next;
                 app.reveal_secrets = false;
                 let _ = render(&app);
@@ -1256,12 +1406,7 @@ fn bind_segmented_controls(shared: &SharedApp) -> Result<(), JsValue> {
             }
         })?;
     }
-    for (id, mode) in [
-        ("input-mode-json", InputMode::Json),
-        ("input-mode-rt", InputMode::Rt),
-        ("input-mode-mobile-rt", InputMode::MobileRt),
-        ("input-mode-at", InputMode::At),
-    ] {
+    for (id, mode) in INPUT_MODE_CONTROLS {
         let button: HtmlButtonElement = by_id(id)?;
         let click_shared = Rc::clone(shared);
         listen_event(&button, "click", move |_| {
@@ -1280,6 +1425,8 @@ fn bind_segmented_controls(shared: &SharedApp) -> Result<(), JsValue> {
             let _ = set_input_status(
                 if mode == InputMode::Json {
                     "已切换为 JSON 输入。".to_owned()
+                } else if mode == InputMode::AgentIdentity {
+                    "已切换为 AI 输入，本地校验 Agent Identity JSON。".to_owned()
                 } else {
                     format!("已切换为手动 {} 输入。", token_label(mode))
                 }
@@ -1299,7 +1446,7 @@ fn bind_input(shared: &SharedApp) -> Result<(), JsValue> {
     })?;
     let input_shared = Rc::clone(shared);
     listen_event(&input, "input", move |_| {
-        if input_shared.borrow().input_mode != InputMode::Json {
+        if !is_json_input_mode(input_shared.borrow().input_mode) {
             let _ = schedule_input_processing(&input_shared, 450);
         }
     })?;
@@ -1360,7 +1507,7 @@ fn bind_file_controls(shared: &SharedApp) -> Result<(), JsValue> {
     }
     let drop_shared = Rc::clone(shared);
     listen_drag(&dropzone, "drop", move |event| {
-        if drop_shared.borrow().input_mode == InputMode::Json {
+        if is_json_input_mode(drop_shared.borrow().input_mode) {
             if let Some(files) = event.data_transfer().and_then(|transfer| transfer.files()) {
                 process_files(Rc::clone(&drop_shared), collect_files(&files));
             }

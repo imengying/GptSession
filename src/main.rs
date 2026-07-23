@@ -1,12 +1,11 @@
-use session_bridge::{AppState, ReqwestOpenAiGateway, build_app};
+use session_bridge::build_app;
 use tokio::{net::TcpListener, signal};
 
 const BIND_ADDRESS: &str = "0.0.0.0:3000";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let gateway = ReqwestOpenAiGateway::new()?;
-    let app = build_app(AppState::new(gateway));
+    let app = build_app()?;
     let listener = TcpListener::bind(BIND_ADDRESS).await?;
 
     axum::serve(listener, app)

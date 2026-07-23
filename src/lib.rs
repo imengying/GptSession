@@ -7,7 +7,7 @@ mod web;
 compile_error!("Session Bridge browser frontend requires wasm64-unknown-unknown");
 
 #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
-pub use server::{AppState, ReqwestOpenAiGateway, build_app};
+pub use server::build_app;
 
 #[cfg(target_arch = "wasm64")]
 use wasm_bindgen::prelude::*;
