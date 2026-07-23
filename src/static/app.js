@@ -1,8 +1,8 @@
-import init from "/assets/session_bridge_web.js?v=20260723-5";
+import init from "/assets/session_bridge_web.js?v=20260723-7";
 
 try {
   await init({
-    module_or_path: "/assets/session_bridge_web_bg.wasm?v=20260723-5",
+    module_or_path: "/assets/session_bridge_web_bg.wasm?v=20260723-7",
   });
 } catch {
   const status = document.querySelector("#input-status");

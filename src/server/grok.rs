@@ -140,7 +140,7 @@ impl ReqwestGrokGateway {
         unreachable!("redirect loop always returns")
     }
 
-    async fn convert_sso(&self, sso_token: &str) -> Result<Map<String, Value>, GrokError> {
+    pub(super) async fn sso(&self, sso_token: &str) -> Result<Map<String, Value>, GrokError> {
         let mut cookies = BTreeMap::from([
             ("sso".to_owned(), sso_token.to_owned()),
             ("sso-rw".to_owned(), sso_token.to_owned()),
@@ -356,10 +356,6 @@ impl ReqwestGrokGateway {
             "GROK_OAUTH_REQUEST_FAILED",
             format!("xAI OAuth 请求失败（HTTP {}）", response.status),
         ))
-    }
-
-    pub(super) async fn sso(&self, sso_token: &str) -> Result<Map<String, Value>, GrokError> {
-        self.convert_sso(sso_token).await
     }
 }
 

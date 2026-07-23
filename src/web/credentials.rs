@@ -22,10 +22,25 @@ pub const GROK_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 
 const GROK_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
 const GROK_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
+const CPA_XAI_BASE_URL: &str = "https://api.x.ai/v1";
+const CPA_XAI_FIELDS: [&str; 14] = [
+    "access_token",
+    "auth_kind",
+    "base_url",
+    "disabled",
+    "email",
+    "expired",
+    "expires_in",
+    "id_token",
+    "last_refresh",
+    "refresh_token",
+    "sub",
+    "token_endpoint",
+    "token_type",
+    "type",
+];
 const GROK_TOKEN_ENDPOINT: &str = "https://auth.x.ai/oauth2/token";
 
-const SESSION_BRIDGE_KEY: &str = "session_bridge";
-const SESSION_BRIDGE_SCHEMA: i64 = 1;
 const MAX_CPA_FILE_TOKEN_BYTES: usize = 240;
 const MAX_ACCESS_TOKEN_LENGTH: usize = 8 * 1024;
 const MAX_REFRESH_TOKEN_LENGTH: usize = 16 * 1024;
@@ -556,12 +571,7 @@ fn email_from_name(value: Option<&Value>) -> Option<String> {
     candidate.contains('@').then(|| candidate.to_owned())
 }
 
-fn build_sub2api_settings(
-    record: &JsonMap,
-    document_fields: Option<JsonMap>,
-    restored_from_bridge: bool,
-    credential_keys: Option<Vec<String>>,
-) -> Sub2ApiSettings {
+fn build_sub2api_settings(record: &JsonMap, document_fields: Option<JsonMap>) -> Sub2ApiSettings {
     let credentials = record
         .get("credentials")
         .and_then(Value::as_object)
@@ -577,8 +587,7 @@ fn build_sub2api_settings(
         .filter(|(key, _)| !matches!(key.as_str(), "credentials" | "extra"))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    let original_credential_keys =
-        credential_keys.unwrap_or_else(|| credentials.keys().cloned().collect());
+    let original_credential_keys = credentials.keys().cloned().collect();
     Sub2ApiSettings {
         name: record.get("name").and_then(non_empty),
         platform: record.get("platform").and_then(non_empty),
@@ -594,47 +603,11 @@ fn build_sub2api_settings(
         account_fields,
         original_credential_keys,
         document_fields,
-        restored_from_bridge,
     }
-}
-
-fn read_bridge_settings(record: &JsonMap) -> Option<Sub2ApiSettings> {
-    let bridge = record.get(SESSION_BRIDGE_KEY)?.as_object()?;
-    if bridge.get("schema").and_then(Value::as_i64) != Some(SESSION_BRIDGE_SCHEMA)
-        || bridge.get("source").and_then(Value::as_str) != Some("sub2api")
-    {
-        return None;
-    }
-    let sub2api = bridge.get("sub2api")?.as_object()?;
-    let account = sub2api
-        .get("account")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let credentials = sub2api
-        .get("credentials")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let extra = sub2api
-        .get("extra")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let document = sub2api.get("document").and_then(Value::as_object).cloned();
-    let keys = sub2api
-        .get("credential_keys")
-        .and_then(Value::as_array)
-        .map(|values| values.iter().filter_map(non_empty).collect::<Vec<String>>())
-        .unwrap_or_else(|| credentials.keys().cloned().collect());
-    let mut rebuilt = account;
-    rebuilt.insert("credentials".to_owned(), Value::Object(credentials));
-    rebuilt.insert("extra".to_owned(), Value::Object(extra));
-    Some(build_sub2api_settings(&rebuilt, document, true, Some(keys)))
 }
 
 fn build_sub2api_normalization_record(record: &JsonMap, exported_at: Option<&str>) -> JsonMap {
-    let settings = build_sub2api_settings(record, None, false, None);
+    let settings = build_sub2api_settings(record, None);
     let credentials = &settings.credentials;
     let extra = &settings.extra;
     let grok = settings
@@ -789,8 +762,6 @@ fn collect_candidates(value: &Value, source_name: &str) -> Vec<CredentialCandida
                             sub2api_settings: Some(build_sub2api_settings(
                                 account,
                                 Some(document_fields.clone()),
-                                false,
-                                None,
                             )),
                         });
                     } else {
@@ -808,8 +779,8 @@ fn collect_candidates(value: &Value, source_name: &str) -> Vec<CredentialCandida
             return;
         }
         if is_likely_agent_identity(record) {
-            let sub2api_settings = is_likely_sub2api_account(record)
-                .then(|| build_sub2api_settings(record, None, false, None));
+            let sub2api_settings =
+                is_likely_sub2api_account(record).then(|| build_sub2api_settings(record, None));
             let value = sub2api_settings.as_ref().map_or_else(
                 || record.clone(),
                 |_| build_sub2api_normalization_record(record, None),
@@ -831,7 +802,7 @@ fn collect_candidates(value: &Value, source_name: &str) -> Vec<CredentialCandida
                 source_path: path.to_owned(),
                 source_type: SourceType::Sub2Api,
                 exported_at: None,
-                sub2api_settings: Some(build_sub2api_settings(record, None, false, None)),
+                sub2api_settings: Some(build_sub2api_settings(record, None)),
             });
             return;
         }
@@ -842,7 +813,7 @@ fn collect_candidates(value: &Value, source_name: &str) -> Vec<CredentialCandida
                 source_path: path.to_owned(),
                 source_type: SourceType::Cpa,
                 exported_at: None,
-                sub2api_settings: read_bridge_settings(record),
+                sub2api_settings: None,
             });
             return;
         }
@@ -1522,13 +1493,7 @@ pub fn parse_credential_text(text: &str, source_name: &str, now_ms: f64) -> Pars
         for candidate in candidates {
             let preserved = if candidate.source_type == SourceType::Cpa {
                 let mut fields = without_credential_fields(&candidate.value);
-                if candidate
-                    .sub2api_settings
-                    .as_ref()
-                    .is_some_and(|settings| settings.restored_from_bridge)
-                {
-                    fields.remove(SESSION_BRIDGE_KEY);
-                }
+                fields.remove("session_bridge");
                 Some(fields)
             } else if candidate.source_type == SourceType::Sub2Api {
                 Some(without_credential_fields(
@@ -2282,20 +2247,6 @@ fn insert_optional(map: &mut JsonMap, key: &str, value: Option<Value>) {
     }
 }
 
-fn bridge_metadata(settings: &Sub2ApiSettings) -> Value {
-    json!({
-        "schema": SESSION_BRIDGE_SCHEMA,
-        "source": "sub2api",
-        "sub2api": {
-            "document": settings.document_fields.clone().unwrap_or_default(),
-            "account": settings.account_fields,
-            "credentials": without_credential_fields(&settings.credentials),
-            "credential_keys": settings.original_credential_keys,
-            "extra": settings.extra,
-        },
-    })
-}
-
 fn is_grok_account(account: &NormalizedAccount) -> bool {
     account
         .sub2api_settings
@@ -2331,6 +2282,7 @@ fn account_credential(account: &NormalizedAccount, key: &str) -> Option<String> 
 
 fn to_cpa_grok_record(account: &NormalizedAccount, now_ms: f64) -> Value {
     let mut output = account.preserved_cpa_fields.clone().unwrap_or_default();
+    output.retain(|key, _| CPA_XAI_FIELDS.contains(&key.as_str()));
     let expired = account
         .export_expires_at
         .clone()
@@ -2375,27 +2327,16 @@ fn to_cpa_grok_record(account: &NormalizedAccount, now_ms: f64) -> Value {
     output.insert("expires_in".to_owned(), json!(expires_in));
     insert_optional(&mut output, "expired", expired.map(Value::String));
     output.insert("last_refresh".to_owned(), json!(account.last_refresh));
-    output
-        .entry("redirect_uri".to_owned())
-        .or_insert_with(|| json!(""));
     output.insert("token_endpoint".to_owned(), json!(GROK_TOKEN_ENDPOINT));
-    output.insert(
-        "base_url".to_owned(),
-        json!(account_credential(account, "base_url").unwrap_or_else(|| GROK_BASE_URL.to_owned())),
-    );
+    let base_url = account
+        .preserved_cpa_fields
+        .as_ref()
+        .and_then(|fields| fields.get("base_url"))
+        .and_then(non_empty)
+        .filter(|url| !url.eq_ignore_ascii_case(GROK_BASE_URL))
+        .unwrap_or_else(|| CPA_XAI_BASE_URL.to_owned());
+    output.insert("base_url".to_owned(), json!(base_url));
     output.insert("disabled".to_owned(), Value::Bool(account.disabled));
-    output.entry("headers".to_owned()).or_insert_with(|| {
-        json!({
-            "X-XAI-Token-Auth": "xai-grok-cli",
-            "x-grok-client-identifier": "grok-shell",
-            "x-grok-client-version": "0.2.93",
-        })
-    });
-    if let Some(settings) = &account.sub2api_settings {
-        output.insert(SESSION_BRIDGE_KEY.to_owned(), bridge_metadata(settings));
-    } else {
-        output.remove(SESSION_BRIDGE_KEY);
-    }
     Value::Object(output)
 }
 
@@ -2684,11 +2625,7 @@ pub fn to_cpa_record(account: &NormalizedAccount, now_ms: f64) -> Value {
         plan_type.map(|plan| format!("gpt-{plan}-all-ws")),
     ]);
     insert_optional(&mut output, "source", source.map(Value::String));
-    if let Some(settings) = &account.sub2api_settings {
-        output.insert(SESSION_BRIDGE_KEY.to_owned(), bridge_metadata(settings));
-    } else {
-        output.remove(SESSION_BRIDGE_KEY);
-    }
+    output.remove("session_bridge");
     Value::Object(output)
 }
 

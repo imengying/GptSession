@@ -507,8 +507,9 @@ fn render_accounts(app: &App) -> Result<(), JsValue> {
 
 fn render_issues(app: &App) -> Result<(), JsValue> {
     let format_issues = format_issues(app);
+    let has_format_issues = !format_issues.is_empty();
     let mut entries = app.issues.clone();
-    entries.extend(format_issues.clone());
+    entries.extend(format_issues);
     for account in &app.accounts {
         entries.extend(account.warnings.iter().map(|warning| {
             ParseIssue {
@@ -546,7 +547,7 @@ fn render_issues(app: &App) -> Result<(), JsValue> {
         })
         .collect::<String>();
     html_element("issues-list")?.set_inner_html(&list);
-    if app.accounts.is_empty() || !app.issues.is_empty() || !format_issues.is_empty() {
+    if app.accounts.is_empty() || !app.issues.is_empty() || has_format_issues {
         details.set_open(true);
     }
     Ok(())
@@ -807,10 +808,8 @@ fn prepare_manual_input(shared: &SharedApp) -> Result<Option<ParseResult>, JsVal
     {
         let mut app = shared.borrow_mut();
         cancel_operation(&mut app);
-        app.accounts.clear();
+        reset_results(&mut app);
         app.issues = parsed.issues.clone();
-        app.generated_at = None;
-        app.reveal_secrets = false;
         render(&app)?;
     }
     if parsed.accounts.is_empty() {

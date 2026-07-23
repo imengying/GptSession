@@ -127,7 +127,6 @@ impl ReqwestOpenAiGateway {
             self.client
                 .post(OPENAI_OAUTH_TOKEN_URL)
                 .header(reqwest::header::ACCEPT, "application/json")
-                .header(reqwest::header::USER_AGENT, OPENAI_USER_AGENT)
                 .form(&form)
                 .send()
                 .await,
@@ -145,7 +144,6 @@ impl ReqwestOpenAiGateway {
                     format!("Bearer {access_token}"),
                 )
                 .header("Originator", "codex_cli_rs")
-                .header(reqwest::header::USER_AGENT, OPENAI_USER_AGENT)
                 .send()
                 .await,
         )
@@ -596,21 +594,7 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
 }
 
 fn api_json(status: StatusCode, payload: Value) -> Response {
-    let mut response = (status, Json(payload)).into_response();
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, max-age=0"),
-    );
-    headers.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
-    headers.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    response
+    (status, Json(payload)).into_response()
 }
 
 fn token_validation_error(token: &str, token_type: TokenType) -> Option<&'static str> {

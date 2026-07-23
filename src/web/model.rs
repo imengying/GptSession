@@ -84,7 +84,6 @@ pub struct Sub2ApiSettings {
     pub account_fields: JsonMap,
     pub original_credential_keys: Vec<String>,
     pub document_fields: Option<JsonMap>,
-    pub restored_from_bridge: bool,
 }
 
 #[derive(Clone)]

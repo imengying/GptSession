@@ -1,6 +1,6 @@
 use std::{cell::Cell, rc::Rc};
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -291,27 +291,22 @@ pub async fn validate_access_token(access_token: &str) -> Result<PersonalAccessT
     )
     .await
     .map_err(format_api_error)?;
-    let required = [
-        ("email", "邮箱"),
-        ("chatgpt_user_id", "user_id"),
-        ("chatgpt_account_id", "account_id"),
-        ("chatgpt_plan_type", "套餐"),
-    ];
-    let mut values = Map::new();
-    for (key, label) in required {
-        let value = string_field(&fields, key)
-            .ok_or_else(|| format!("OpenAI AT 验证结果缺少必要字段：{label}"))?;
-        values.insert(key.to_owned(), Value::String(value));
-    }
+    let required = |key, label| {
+        string_field(&fields, key).ok_or_else(|| format!("OpenAI AT 验证结果缺少必要字段：{label}"))
+    };
+    let email = required("email", "邮箱")?;
+    let user_id = required("chatgpt_user_id", "user_id")?;
+    let account_id = required("chatgpt_account_id", "account_id")?;
+    let plan_type = required("chatgpt_plan_type", "套餐")?;
     let is_fedramp = fields
         .get("chatgpt_account_is_fedramp")
         .and_then(Value::as_bool)
         .ok_or_else(|| "OpenAI AT 验证结果缺少必要字段：FedRAMP".to_owned())?;
     Ok(PersonalAccessTokenInfo {
-        email: string_field(&values, "email").unwrap_or_default(),
-        user_id: string_field(&values, "chatgpt_user_id").unwrap_or_default(),
-        account_id: string_field(&values, "chatgpt_account_id").unwrap_or_default(),
-        plan_type: string_field(&values, "chatgpt_plan_type").unwrap_or_default(),
+        email,
+        user_id,
+        account_id,
+        plan_type,
         is_fedramp,
     })
 }
